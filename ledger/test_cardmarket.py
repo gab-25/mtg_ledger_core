@@ -1,13 +1,12 @@
 import copy
 from decimal import Decimal
-from unittest import mock
 
 import httpx
 from django.test import TestCase
 
-from . import cardmarket, catalog_sync, services
+from . import cardmarket
 from .models import Card, CardmarketPrice
-from .tests import FakeCardTrader
+from .tests import LedgerTestCase, cm_id, load_catalog
 
 GUIDE = {
     "version": 1, "createdAt": "2026-11-07T02:45:31+0100",
@@ -19,10 +18,6 @@ GUIDE = {
         {"idProduct": 999999, "idCategory": 1, "trend": 99},
     ],
 }
-
-# CardTrader blueprint id -> Cardmarket ids (FakeCardTrader's catalog has none of its own)
-CM_IDS = {1001: [555001], 1201: [555201, 555202], 1002: []}
-
 
 SINGLES = {"version": 1, "createdAt": "2026-11-14T12:00:09+0100", "products": [
     {"idProduct": 501201, "name": "Counterspell", "idCategory": 1, "categoryName": "Magic Single",
@@ -84,54 +79,34 @@ class FakeGuide:
         return cardmarket.make_client(transport=httpx.MockTransport(self.handler))
 
 
-class CardmarketTestCase(TestCase):
-    def setUp(self):
-        self.ct = FakeCardTrader()
-        for expansion in self.ct.blueprints.values():
-            for bp in expansion:
-                bp["card_market_ids"] = CM_IDS.get(bp["id"], [])
-                bp["image_url"] = f"https://img/{bp['id']}.jpg"
-                bp["image"] = {"url": f"/uploads/{bp['id']}.jpg", "show": {"url": f"/uploads/show_{bp['id']}.jpg"}}
-        self.guide = FakeGuide()
-        self.cm = self.guide.client()
-        self.addCleanup(self.cm.close)
-        for target, attr, value in (
-            (services, "make_client", mock.Mock(side_effect=self.ct.client)),
-            (catalog_sync, "BLUEPRINT_PAUSE", 0),
-        ):
-            patcher = mock.patch.object(target, attr, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def sync(self):
-        with self.ct.client() as ct:
-            return catalog_sync.sync(self.cm, ct)
-
-
-class SuggestedPriceTest(CardmarketTestCase):
+class SuggestedPriceTest(LedgerTestCase):
     def setUp(self):
         super().setUp()
-        self.sync()
+        load_catalog()
+        CardmarketPrice.objects.create(id_product=cm_id(1001), trend=Decimal("42.00"), trend_foil=Decimal("61.25"))
+        CardmarketPrice.objects.create(id_product=cm_id(1201), trend=Decimal("1.20"), trend_foil=Decimal("3.00"))
 
-    def test_non_foil_uses_trend_via_blueprint_link(self):
-        card = Card.objects.create(name="Ragavan", set_code="MH2", collector_number="138", ct_blueprint_id=1001)
+    def test_non_foil_uses_trend_via_product_link(self):
+        card = Card.objects.create(name="Ragavan", set_code="MH2", collector_number="138", cm_product_id=cm_id(1001))
         self.assertEqual(cardmarket.suggested_price(card, foil=False), Decimal("42.00"))
 
     def test_foil_uses_trend_foil(self):
-        card = Card.objects.create(name="Ragavan", set_code="MH2", collector_number="138", ct_blueprint_id=1001)
+        card = Card.objects.create(name="Ragavan", set_code="MH2", collector_number="138", cm_product_id=cm_id(1001))
         self.assertEqual(cardmarket.suggested_price(card, foil=True), Decimal("61.25"))
 
     def test_foil_without_foil_trend(self):
-        CardmarketPrice.objects.filter(pk=555201).update(trend_foil=None)
-        card = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="45", ct_blueprint_id=1201)
+        CardmarketPrice.objects.filter(pk=cm_id(1201)).update(trend_foil=None)
+        card = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="45",
+                                   cm_product_id=cm_id(1201))
         self.assertIsNone(cardmarket.suggested_price(card, foil=True))
 
     def test_zero_trend_is_no_price(self):
-        CardmarketPrice.objects.filter(pk=555201).update(trend_foil=Decimal("0.00"))
-        card = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="45", ct_blueprint_id=1201)
+        CardmarketPrice.objects.filter(pk=cm_id(1201)).update(trend_foil=Decimal("0.00"))
+        card = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="45",
+                                   cm_product_id=cm_id(1201))
         self.assertIsNone(cardmarket.suggested_price(card, foil=True))
 
-    def test_card_without_blueprint_found_by_set_and_number(self):
+    def test_card_without_product_found_by_set_and_number(self):
         card = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="045")
         self.assertEqual(cardmarket.suggested_price(card, foil=False), Decimal("1.20"))
 
@@ -139,6 +114,6 @@ class SuggestedPriceTest(CardmarketTestCase):
         card = Card.objects.create(name="X", set_code="PLST", collector_number="9")
         self.assertIsNone(cardmarket.suggested_price(card, foil=False))
 
-    def test_blueprint_without_cardmarket_id(self):
-        card = Card.objects.create(name="Solitude", set_code="MH2", collector_number="32", ct_blueprint_id=1002)
+    def test_product_without_price_row(self):
+        card = Card.objects.create(name="Solitude", set_code="MH2", collector_number="32", cm_product_id=cm_id(1002))
         self.assertIsNone(cardmarket.suggested_price(card, foil=False))

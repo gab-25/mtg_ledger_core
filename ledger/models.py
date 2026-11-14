@@ -58,6 +58,10 @@ class Card(models.Model):
     name = models.CharField(max_length=200)
     set_code = models.CharField(max_length=10)
     collector_number = models.CharField(max_length=40, blank=True, default="")
+    cm_product_id = models.PositiveIntegerField(
+        "Cardmarket product", null=True, blank=True, db_index=True,
+        help_text="Its printing in the catalog (Blueprint); the catalog sync keeps one card per product",
+    )
     ct_blueprint_id = models.PositiveIntegerField(
         "CardTrader blueprint", null=True, blank=True, help_text="Matched automatically on first publish"
     )
@@ -312,12 +316,11 @@ class OrderItem(models.Model):
 
 
 class Expansion(models.Model):
-    """A CardTrader MTG expansion (local catalog copy)."""
+    """A Scryfall MTG set (local catalog copy): its printings come from Cardmarket's product lists."""
 
-    ct_id = models.PositiveIntegerField("CardTrader expansion", unique=True)
-    code = models.CharField(max_length=10, db_index=True)
+    code = models.CharField(max_length=10, unique=True, help_text="Scryfall set code, lower case")
     name = models.CharField(max_length=200)
-    blueprints_synced_at = models.DateTimeField(null=True, blank=True)
+    released_at = models.DateField(null=True, blank=True)
 
     class Meta:
         ordering = ["name"]
@@ -326,15 +329,15 @@ class Expansion(models.Model):
         return f"{self.code.upper()} · {self.name}"
 
 
-# CardTrader categories that are cards (collector number, condition, foil): Single Card, Token/Emblem, Oversized.
+# The Cardmarket category of cards (collector number, condition, foil): "Magic Single", tokens included.
 # Every other category (sealed, accessories, ...) is a product.
-CARD_CATEGORY_IDS = frozenset({1, 2, 3})
+CARD_CATEGORY_ID = 1
 
 
 class Category(models.Model):
-    """A CardTrader MTG product category (local catalog copy): single cards, booster boxes, playmats, ..."""
+    """A Cardmarket MTG product category (local catalog copy): single cards, boosters, displays, ..."""
 
-    ct_id = models.PositiveIntegerField("CardTrader category", unique=True)
+    cm_id = models.PositiveIntegerField("Cardmarket category", unique=True)
     name = models.CharField(max_length=100, blank=True)
 
     class Meta:
@@ -342,31 +345,24 @@ class Category(models.Model):
         verbose_name_plural = "categories"
 
     def __str__(self):
-        return self.name or f"Category {self.ct_id}"
+        return self.name or f"Category {self.cm_id}"
 
 
 class Blueprint(models.Model):
-    """A CardTrader blueprint: one printing of a card (local catalog copy)."""
+    """One printing of a card, or a product, in the local catalog: a Cardmarket product, described by Scryfall."""
 
-    ct_id = models.PositiveIntegerField("CardTrader blueprint", unique=True)
+    cm_product = models.OneToOneField(
+        "CardmarketPrice", null=True, blank=True, on_delete=models.DO_NOTHING, db_constraint=False,
+        related_name="blueprint",
+        verbose_name="Cardmarket product", help_text="Cardmarket's idProduct; its price row may not exist",
+    )
     expansion = models.ForeignKey(Expansion, on_delete=models.CASCADE, related_name="blueprints")
     name = models.CharField(max_length=200, db_index=True)
     collector_number = models.CharField(max_length=40, blank=True)
-    version = models.CharField(max_length=80, blank=True)
     rarity = models.CharField(max_length=40, blank=True)
-    image_url = models.URLField(max_length=500, blank=True)
-    image_large_url = models.URLField(
-        max_length=500, blank=True, help_text="CardTrader's large image (488×680); image_url is its thumbnail",
-    )
+    image_url = models.URLField(max_length=500, blank=True, help_text="Scryfall's small image")
+    image_large_url = models.URLField(max_length=500, blank=True, help_text="Scryfall's normal image (488×680)")
     category = models.ForeignKey(Category, null=True, blank=True, on_delete=models.SET_NULL, related_name="blueprints")
-    editable_properties = models.JSONField(
-        null=True, blank=True, help_text="Names of the properties CardTrader accepts when selling it; empty if unknown",
-    )
-    cm_price = models.ForeignKey(
-        "CardmarketPrice", null=True, blank=True, on_delete=models.DO_NOTHING, db_constraint=False,
-        related_name="blueprints", verbose_name="Cardmarket product",
-        help_text="First of the blueprint's Cardmarket ids; its price row may not exist",
-    )
 
     class Meta:
         ordering = ["expansion__name", "name"]
@@ -374,11 +370,7 @@ class Blueprint(models.Model):
     @property
     def is_product(self):
         """Sealed product or accessory rather than a card; a blueprint not yet categorised counts as a card."""
-        return self.category_id is not None and self.category.ct_id not in CARD_CATEGORY_IDS
-
-    def accepts(self, prop):
-        """Whether CardTrader accepts this property for it; unknown properties are assumed accepted."""
-        return self.editable_properties is None or prop in self.editable_properties
+        return self.category_id is not None and self.category.cm_id != CARD_CATEGORY_ID
 
     def __str__(self):
         number = f" #{self.collector_number}" if self.collector_number else ""
@@ -442,7 +434,7 @@ class ScanLine(models.Model):
     condition = models.CharField(max_length=2, choices=Condition.choices)
     quantity = models.PositiveIntegerField(default=1)
     needs_confirmation = models.BooleanField(default=False)
-    candidates = models.JSONField(default=list, blank=True, help_text="Blueprint ct_ids to choose from")
+    candidates = models.JSONField(default=list, blank=True, help_text="Cardmarket product ids to choose from")
     read_name = models.CharField(max_length=200, blank=True, help_text="The card name the model read")
     frame = models.BinaryField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

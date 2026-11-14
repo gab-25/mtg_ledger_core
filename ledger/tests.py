@@ -1,5 +1,5 @@
 import json
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from unittest import mock
 
@@ -22,6 +22,49 @@ SINGLE_PROPS = [
     LANGUAGE_PROP,
     {"name": "mtg_foil", "type": "boolean", "default_value": "false", "possible_values": [True, False]},
 ]
+
+
+def cm_id(ct_id):
+    """The Cardmarket product id the test catalog gives to a FakeCardTrader blueprint."""
+    return ct_id + 500000
+
+
+# The local test catalog (load_catalog): the printings of FakeCardTrader, keyed by Cardmarket product id.
+CATALOG_EXPANSIONS = [  # code, name, release date
+    ("mh2", "Modern Horizons 2", date(2021, 6, 18)),
+    ("neo", "Kamigawa: Neon Dynasty", date(2022, 2, 18)),
+    ("dmr", "Dominaria Remastered", date(2023, 1, 13)),
+    ("dmu", "Dominaria United", date(2022, 9, 9)),
+]
+CATALOG_CATEGORIES = [(1, "Magic Single"), (5, "Magic Display"), (13, "Magic Miscellaneous")]
+CATALOG = [  # Cardmarket id, expansion code, name, collector number, Cardmarket category
+    (cm_id(1001), "mh2", "Ragavan, Nimble Pilferer", "138", 1),
+    (cm_id(1002), "mh2", "Solitude", "32", 1),
+    (cm_id(1003), "mh2", "Urza’s Saga", "259", 1),
+    (cm_id(1004), "mh2", "Endurance", "157", 1),
+    (cm_id(1101), "neo", "Fable of the Mirror-Breaker", "356", 1),
+    (cm_id(1100), "neo", "Fable of the Mirror-Breaker", "141", 1),
+    (cm_id(1201), "dmr", "Counterspell", "45", 1),
+    (cm_id(1301), "dmu", "Sheoldred, the Apocalypse", "107", 1),
+    (cm_id(1390), "dmu", "Dominaria United Draft Booster Box", "", 5),
+    (cm_id(1391), "dmu", "Dominaria United Playmat", "", 13),
+]
+
+
+def load_catalog():
+    """Put the test catalog in the database, as the catalog sync would."""
+    from .models import Blueprint, Category, Expansion
+
+    expansions = {code: Expansion.objects.update_or_create(code=code, defaults={"name": name, "released_at": day})[0]
+                  for code, name, day in CATALOG_EXPANSIONS}
+    categories = {i: Category.objects.update_or_create(cm_id=i, defaults={"name": name})[0]
+                  for i, name in CATALOG_CATEGORIES}
+    for cm, code, name, number, category in CATALOG:
+        Blueprint.objects.update_or_create(cm_product_id=cm, defaults={
+            "expansion": expansions[code], "name": name, "collector_number": number,
+            "category": categories[category], "image_url": f"https://img/{cm}-small.jpg",
+            "image_large_url": f"https://img/{cm}-normal.jpg",
+        })
 
 
 class FakeCardTrader:
@@ -49,6 +92,9 @@ class FakeCardTrader:
                  {"id": 1391, "category_id": 40, "editable_properties": [],
                   "name": "Dominaria United Playmat", "version": None, "fixed_properties": {}}],
         }
+        for blueprints in self.blueprints.values():
+            for bp in blueprints:
+                bp["card_market_ids"] = [cm_id(bp["id"])]
         self.categories = [
             {"id": 1, "game_id": 1, "name": "Magic Single Card"},
             {"id": 4, "game_id": 1, "name": "Booster Boxes"},
@@ -330,14 +376,8 @@ class PagesTest(LedgerTestCase):
 
 
 def load_dmu(test):
-    """Put Dominaria United (cards, a booster box, a playmat) and the categories in the local catalog."""
-    from . import catalog
-    from .models import Expansion
-
-    client = test.ct.client()
-    catalog.sync_expansions(client)
-    catalog.sync_categories(client)
-    catalog.ensure_blueprints(client, Expansion.objects.get(ct_id=13))
+    """Put the test catalog (Dominaria United: cards, a booster box, a playmat, and the rest) in the database."""
+    load_catalog()
 
 
 def add(test, blueprint, **fields):
@@ -352,26 +392,26 @@ class ItemTest(LedgerTestCase):
 
     def test_add_card_from_catalog(self):
         self.client.force_login(self.other)
-        resp = add(self, 1301, condition="LP", language="IT", foil=True, quantity=2, price="50.00")
+        resp = add(self, cm_id(1301), condition="LP", language="IT", foil=True, quantity=2, price="50.00")
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(resp.json()["messages"], [{"level": "success", "text": "Added 2× Sheoldred, the Apocalypse."}])
         item = CollectionItem.objects.get(pk=resp.json()["id"], owner=self.other)
         self.assertEqual((item.condition, item.language, item.foil, item.quantity), ("LP", "IT", True, 2))
-        self.assertEqual((item.card.ct_blueprint_id, item.card.is_product), (1301, False))
+        self.assertEqual((item.card.cm_product_id, item.card.is_product), (cm_id(1301), False))
 
     def test_add_product_ignores_condition_and_foil(self):
-        item = CollectionItem.objects.get(pk=add(self, 1390, condition="PL", foil=True).json()["id"])
+        item = CollectionItem.objects.get(pk=add(self, cm_id(1390), condition="PL", foil=True).json()["id"])
         self.assertEqual((item.condition, item.foil), ("NM", False))
         self.assertTrue(item.card.is_product)
-        self.assertEqual((item.card.name, item.card.collector_number), ("Dominaria United Draft Booster Box", "CT1390"))
+        self.assertEqual((item.card.name, item.card.collector_number), ("Dominaria United Draft Booster Box", f"CM{cm_id(1390)}"))
 
-    def test_add_product_without_language_stores_en(self):
-        item = CollectionItem.objects.get(pk=add(self, 1391, language="IT").json()["id"])
-        self.assertEqual(item.language, "EN")
+    def test_add_product_keeps_the_chosen_language(self):
+        item = CollectionItem.objects.get(pk=add(self, cm_id(1391), language="IT").json()["id"])
+        self.assertEqual(item.language, "IT")
 
     def test_add_same_stack_merges(self):
-        first = add(self, 1390, quantity=1)
-        second = add(self, 1390, quantity=2)
+        first = add(self, cm_id(1390), quantity=1)
+        second = add(self, cm_id(1390), quantity=2)
         self.assertEqual((first.status_code, second.status_code), (201, 200))
         self.assertEqual(second.json()["id"], first.json()["id"])
         self.assertEqual(second.json()["messages"][0]["text"],
@@ -380,31 +420,20 @@ class ItemTest(LedgerTestCase):
         self.assertEqual(item.quantity, 3)
 
     def test_add_with_existing_duplicate_stacks_merges_into_the_oldest(self):
-        first = CollectionItem.objects.get(pk=add(self, 1390, quantity=1).json()["id"])
+        first = CollectionItem.objects.get(pk=add(self, cm_id(1390), quantity=1).json()["id"])
         twin = CollectionItem.objects.create(owner=self.user, card=first.card, condition="NM", language="EN",
                                              quantity=4)  # made by the old free-text form
-        resp = add(self, 1390, quantity=2)
+        resp = add(self, cm_id(1390), quantity=2)
         self.assertEqual((resp.status_code, resp.json()["id"]), (200, first.pk))
         first.refresh_from_db()
         twin.refresh_from_db()
         self.assertEqual((first.quantity, twin.quantity), (3, 4))
 
     def test_add_product_without_language_field(self):
-        resp = self.client.post(reverse("ledger:api_collection"), {"blueprint": 1391, "quantity": 1},
+        resp = self.client.post(reverse("ledger:api_collection"), {"blueprint": cm_id(1391), "quantity": 1},
                                 content_type="application/json")
         self.assertEqual(resp.status_code, 201)
         self.assertEqual(CollectionItem.objects.get(pk=resp.json()["id"]).language, "EN")
-
-    def test_card_added_before_categories_becomes_product_on_resync(self):
-        from . import catalog
-        from .models import Blueprint, Expansion
-
-        Blueprint.objects.filter(ct_id=1390).update(category=None)  # catalog loaded before this feature
-        card = CollectionItem.objects.get(pk=add(self, 1390).json()["id"]).card
-        self.assertFalse(card.is_product)
-        catalog.ensure_blueprints(self.ct.client(), Expansion.objects.get(ct_id=13), force=True)
-        card.refresh_from_db()
-        self.assertTrue(card.is_product)
 
     def test_unknown_blueprint_is_400(self):
         resp = add(self, 999999)
@@ -412,7 +441,7 @@ class ItemTest(LedgerTestCase):
         self.assertEqual(resp.json()["blueprint"], ["Unknown catalog product."])
 
     def test_edit_changes_only_the_copy(self):
-        item = CollectionItem.objects.get(pk=add(self, 1301).json()["id"])
+        item = CollectionItem.objects.get(pk=add(self, cm_id(1301)).json()["id"])
         url = reverse("ledger:api_item", args=[item.pk])
         resp = self.client.put(url, {"name": "X", "condition": "LP", "language": "IT", "foil": True,
                                      "quantity": 5}, content_type="application/json")
@@ -421,7 +450,7 @@ class ItemTest(LedgerTestCase):
         self.assertEqual((item.condition, item.quantity, item.card.name), ("LP", 5, "Sheoldred, the Apocalypse"))
 
     def test_edit_product_keeps_nm_non_foil(self):
-        item = CollectionItem.objects.get(pk=add(self, 1390).json()["id"])
+        item = CollectionItem.objects.get(pk=add(self, cm_id(1390)).json()["id"])
         url = reverse("ledger:api_item", args=[item.pk])
         self.client.put(url, {"condition": "PL", "language": "EN", "foil": True, "quantity": 1},
                         content_type="application/json")
@@ -429,20 +458,20 @@ class ItemTest(LedgerTestCase):
         self.assertEqual((item.condition, item.foil), ("NM", False))
 
     def test_category_filter_and_list(self):
-        add(self, 1390)
-        data = self.client.get(reverse("ledger:api_collection"), {"category": "4"}).json()
+        add(self, cm_id(1390))
+        data = self.client.get(reverse("ledger:api_collection"), {"category": "5"}).json()
         [row] = data["results"]
         self.assertEqual((row["name"], row["is_product"], row["category_id"], row["category_name"]),
-                         ("Dominaria United Draft Booster Box", True, 4, "Booster Boxes"))
+                         ("Dominaria United Draft Booster Box", True, 5, "Magic Display"))
         self.assertTrue(data["filtered"])
         everything = self.client.get(reverse("ledger:api_collection")).json()
-        self.assertIn({"id": 4, "name": "Booster Boxes"}, everything["categories"])
+        self.assertIn({"id": 5, "name": "Magic Display"}, everything["categories"])
         self.assertIsNone(next(r for r in everything["results"] if r["name"] == "The One Ring")["category_id"])
 
     def test_collection_rows_carry_blueprint_image(self):
-        Blueprint.objects.filter(ct_id=1390).update(image_url="https://img/1390.jpg",
+        Blueprint.objects.filter(cm_product_id=cm_id(1390)).update(image_url="https://img/1390.jpg",
                                                     image_large_url="https://img/show_1390.jpg")
-        add(self, 1390)
+        add(self, cm_id(1390))
         Card.objects.create(name="Loose Card", set_code="ZZZ")  # no blueprint
         CollectionItem.objects.create(owner=self.user, card=Card.objects.get(name="Loose Card"), quantity=1)
         rows = {r["name"]: r for r in self.client.get(reverse("ledger:api_collection")).json()["results"]}
@@ -474,10 +503,8 @@ class TrendPriceTest(LedgerTestCase):
         load_dmu(self)
         self.client.force_login(self.other)  # an empty collection: only what each test adds
 
-    def guide(self, blueprint, trend, trend_foil, id_product=None):
-        id_product = id_product or 900000 + blueprint
-        CardmarketPrice.objects.create(id_product=id_product, trend=trend, trend_foil=trend_foil)
-        Blueprint.objects.filter(ct_id=blueprint).update(cm_price_id=id_product)
+    def guide(self, blueprint, trend, trend_foil):
+        CardmarketPrice.objects.create(id_product=cm_id(blueprint), trend=trend, trend_foil=trend_foil)
 
     def collection(self):
         return self.client.get(reverse("ledger:api_collection")).json()
@@ -487,20 +514,20 @@ class TrendPriceTest(LedgerTestCase):
 
     def test_row_price_is_trend(self):
         self.guide(1301, Decimal("12.75"), Decimal("14.34"))
-        add(self, 1301)
-        add(self, 1301, foil=True)
+        add(self, cm_id(1301))
+        add(self, cm_id(1301), foil=True)
         prices = self.prices()
         self.assertEqual(prices[("Sheoldred, the Apocalypse", False)], "12.75")
         self.assertEqual(prices[("Sheoldred, the Apocalypse", True)], "14.34")
 
     def test_foil_without_foil_trend_has_no_price(self):
         self.guide(1301, Decimal("1.46"), Decimal("0.00"))
-        add(self, 1301, foil=True)
+        add(self, cm_id(1301), foil=True)
         self.assertIsNone(self.prices()[("Sheoldred, the Apocalypse", True)])
 
     def test_product_uses_trend_even_if_foil(self):
         self.guide(1390, Decimal("150.00"), Decimal("0.00"))
-        item_id = add(self, 1390).json()["id"]
+        item_id = add(self, cm_id(1390)).json()["id"]
         CollectionItem.objects.filter(pk=item_id).update(foil=True)  # an old row
         self.assertEqual(self.prices()[("Dominaria United Draft Booster Box", True)], "150.00")
 
@@ -511,38 +538,38 @@ class TrendPriceTest(LedgerTestCase):
 
     def test_value_sums_trend_times_quantity(self):
         self.guide(1301, Decimal("12.75"), Decimal("14.34"))
-        add(self, 1301, quantity=2)
-        add(self, 1301, foil=True)
+        add(self, cm_id(1301), quantity=2)
+        add(self, cm_id(1301), foil=True)
         CollectionItem.objects.create(owner=self.other, card=Card.objects.create(name="Loose", set_code="ZZZ"),
                                       quantity=5)
         self.assertEqual(self.collection()["stats"]["value"], "39.84")
 
     def test_value_without_any_trend_is_null(self):
-        add(self, 1301)
+        add(self, cm_id(1301))
         self.assertIsNone(self.collection()["stats"]["value"])
 
     def test_collection_item_stores_no_price(self):
         self.assertNotIn("price", [f.name for f in CollectionItem._meta.get_fields()])
 
     def test_add_ignores_price_in_body(self):
-        resp = add(self, 1301, price="abc")
+        resp = add(self, cm_id(1301), price="abc")
         self.assertEqual(resp.status_code, 201)
 
     def test_new_listing_starts_from_trend(self):
         self.guide(1301, Decimal("3.20"), Decimal("4.00"))
-        item_id = add(self, 1301).json()["id"]
+        item_id = add(self, cm_id(1301)).json()["id"]
         data = self.client.get(reverse("ledger:api_listing", args=[item_id])).json()
         self.assertEqual(data["listing"]["price"], "3.20")
 
     def test_new_listing_without_trend_has_no_price(self):
-        item_id = add(self, 1301).json()["id"]
+        item_id = add(self, cm_id(1301)).json()["id"]
         resp = self.client.get(reverse("ledger:api_listing", args=[item_id]))
         self.assertEqual(resp.status_code, 200)
         self.assertIsNone(resp.json()["listing"]["price"])
 
     def test_item_detail_price_is_trend(self):
         self.guide(1301, Decimal("12.75"), Decimal("14.34"))
-        item_id = add(self, 1301).json()["id"]
+        item_id = add(self, cm_id(1301)).json()["id"]
         self.assertEqual(self.client.get(reverse("ledger:api_item", args=[item_id])).json()["price"], "12.75")
 
 
@@ -576,22 +603,22 @@ class CsvTest(LedgerTestCase):
         load_dmu(self)
         upload = SimpleUploadedFile("c.csv", b"name,set,number\nSheoldred the Apocalypse,DMU,0107\n")
         self.assertEqual(self.client.post(reverse("ledger:api_import"), {"file": upload}).status_code, 200)
-        self.assertEqual(Card.objects.get(set_code="DMU", collector_number="107").ct_blueprint_id, 1301)
+        self.assertEqual(Card.objects.get(set_code="DMU", collector_number="107").cm_product_id, cm_id(1301))
 
     def test_import_without_match_stays_unlinked(self):
         load_dmu(self)
         upload = SimpleUploadedFile("c.csv", b"name,set,number\nNobody,DMU,999\nLightning Bolt,M10,\n")
         self.assertEqual(self.client.post(reverse("ledger:api_import"), {"file": upload}).status_code, 200)
-        self.assertIsNone(Card.objects.get(name="Nobody").ct_blueprint_id)
-        self.assertIsNone(Card.objects.get(name="Lightning Bolt").ct_blueprint_id)
+        self.assertIsNone(Card.objects.get(name="Nobody").cm_product_id)
+        self.assertIsNone(Card.objects.get(name="Lightning Bolt").cm_product_id)
 
     def test_import_leaves_printing_held_by_another_card(self):
         load_dmu(self)
-        Card.objects.create(name="Sheoldred, the Apocalypse", set_code="DMU", collector_number="CT1301",
-                            ct_blueprint_id=1301)
+        Card.objects.create(name="Sheoldred, the Apocalypse", set_code="DMU", collector_number=f"CM{cm_id(1301)}",
+                            cm_product_id=cm_id(1301))
         upload = SimpleUploadedFile("c.csv", b"name,set,number\nSheoldred the Apocalypse,DMU,107\n")
         self.assertEqual(self.client.post(reverse("ledger:api_import"), {"file": upload}).status_code, 200)
-        self.assertIsNone(Card.objects.get(set_code="DMU", collector_number="107").ct_blueprint_id)
+        self.assertIsNone(Card.objects.get(set_code="DMU", collector_number="107").cm_product_id)
 
     def test_import_columns(self):
         self.assertEqual(self.client.get(reverse("ledger:api_import")).json()["columns"], list(services.CSV_FIELDS))
@@ -645,7 +672,7 @@ class CollectionIsolationTest(LedgerTestCase):
         load_dmu(self)
         mine = CollectionItem.objects.get(owner=self.user, card__name="Sheoldred, the Apocalypse")
         self.as_other()
-        add(self, 1301, condition=mine.condition, language=mine.language)
+        add(self, cm_id(1301), condition=mine.condition, language=mine.language)
         theirs = CollectionItem.objects.get(owner=self.other)
         self.assertEqual(theirs.card.name, "Sheoldred, the Apocalypse")
         mine.refresh_from_db()
@@ -654,7 +681,7 @@ class CollectionIsolationTest(LedgerTestCase):
     def test_export_contains_only_own_rows(self):
         self.as_other()
         load_dmu(self)
-        add(self, 1390)
+        add(self, cm_id(1390))
         csv_text = self.client.get(reverse("ledger:api_export")).content.decode()
         self.assertIn("Dominaria United Draft Booster Box", csv_text)
         self.assertNotIn("Ragavan", csv_text)
@@ -787,8 +814,8 @@ class ProductSellingTest(LedgerTestCase):
     def setUp(self):
         super().setUp()
         load_dmu(self)
-        self.box = self.listed(1390)
-        self.mat = self.listed(1391)
+        self.box = self.listed(cm_id(1390))
+        self.mat = self.listed(cm_id(1391))
 
     def listed(self, blueprint):
         item = CollectionItem.objects.get(pk=add(self, blueprint, quantity=2).json()["id"])
@@ -801,6 +828,22 @@ class ProductSellingTest(LedgerTestCase):
     def test_publish_booster_box_payload(self):
         self.publish()
         self.assertEqual(self.properties(self.box), {"mtg_language": "en"})
+
+    def test_product_language_sent_only_if_cardtrader_takes_it(self):
+        CollectionItem.objects.filter(pk__in=[self.box.item_id, self.mat.item_id]).update(language="IT")
+        self.publish()
+        self.assertEqual(self.properties(self.box), {"mtg_language": "it"})
+        self.assertEqual(self.properties(self.mat), {})
+
+    def test_publish_unknown_expansion_fails_only_that_listing(self):
+        card = Card.objects.create(name="Mystery", set_code="ZZZ", collector_number="1", cm_product_id=1)
+        item = CollectionItem.objects.create(owner=self.user, card=card, quantity=1)
+        mystery = Listing.objects.create(item=item, quantity=1, price=Decimal("1.00"))
+        resp = self.publish()
+        self.assertIn("card not found in the CardTrader catalog", json.dumps(resp.json()))
+        mystery.refresh_from_db()
+        self.box.refresh_from_db()
+        self.assertEqual((mystery.status, self.box.status), (Listing.Status.TO_PUBLISH, Listing.Status.PUBLISHED))
 
     def test_publish_playmat_has_no_language(self):
         self.publish()

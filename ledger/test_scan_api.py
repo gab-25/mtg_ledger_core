@@ -20,10 +20,10 @@ from .api.scan import SESSION_LIST_LIMIT
 from .api.serializers import MAX_FRAME_BYTES
 from .forms import CatalogItemForm, ItemForm, ListingForm
 from .cardtrader import CardTraderError
-from .models import Blueprint, CollectionItem, Expansion, ScanCapture, ScanLine, ScanSession
+from .models import Blueprint, CollectionItem, Expansion, ScanCapture, ScanLine, ScanSession, SyncService
 from .openrouter import OpenRouterError
 from .recognition import Recognition
-from .tests import LedgerTestCase
+from .tests import LedgerTestCase, cm_id, load_catalog
 
 IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"
 DESKTOP = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36"
@@ -51,10 +51,8 @@ class FakeRecognizer:
 class ScanApiBase(LedgerTestCase):
     def setUp(self):
         super().setUp()
-        api = self.ct.client()
-        catalog.sync_expansions(api)
+        load_catalog()
         self.dmr = Expansion.objects.get(code="dmr")
-        catalog.ensure_blueprints(api, self.dmr)
         self.recognizer = FakeRecognizer()
         patcher = mock.patch.object(services, "make_openrouter", mock.Mock(return_value=self.recognizer))
         patcher.start()
@@ -118,11 +116,6 @@ class SetupAndSessionTest(ScanApiBase):
         self.assertEqual(self.call("get", "scan_api_setup").json()["defaults"],
                          {"expansion_id": self.dmr.pk, "condition": "EX"})
 
-    def test_setup_syncs_expansions_when_empty(self):
-        Expansion.objects.all().delete()
-        body = self.call("get", "scan_api_setup").json()
-        self.assertTrue(any(e["code"] == "dmr" for e in body["expansions"]))
-
     def test_start_preloads_catalog(self):
         resp = self.call("post", "scan_api_sessions", data={"expansion_id": self.dmr.pk, "condition": "EX"})
         self.assertEqual(resp.status_code, 201)
@@ -157,7 +150,7 @@ class SetupAndSessionTest(ScanApiBase):
         body = self.call("get", "scan_api_session", session.uuid).json()["session"]
         self.assertEqual(body["count"], 1)
         line = body["last_line"]
-        self.assertEqual(line["blueprint"]["id"], 1201)
+        self.assertEqual(line["blueprint"]["id"], cm_id(1201))
         self.assertEqual(line["blueprint"]["expansion"]["code"], "dmr")
         self.assertEqual((line["language"], line["condition"]), ("IT", "NM"))
         for gone in ("price", "for_sale", "listed"):
@@ -195,7 +188,7 @@ class SessionListTest(ScanApiBase):
         self.assertEqual(item["status"], "open")
         self.assertEqual(item["expansion"]["code"], "dmr")
         self.assertEqual((item["default_condition"], item["count"]), ("NM", 1))
-        self.assertEqual(item["last_line"]["blueprint"]["id"], 1201)
+        self.assertEqual(item["last_line"]["blueprint"]["id"], cm_id(1201))
         self.assertIn("phone_url", item)
         self.assertTrue(item["created_at"] and item["updated_at"])
 
@@ -379,26 +372,19 @@ class MissingServicesTest(ScanApiBase):
         self.assertEqual(body["detail"], "Card recognition is not available right now — try again later")
         self.assertEqual((self.recognizer.calls, ScanLine.objects.count()), (0, 0))
 
-    def test_capture_without_cardtrader_token_says_so(self):
-        session = self.start()
-        self.set_keys(openrouter="or-key", cardtrader="")
-        body = self.assertError(self.capture(session), 503, "service_missing")
-        self.assertIn("CardTrader is not connected", body["detail"])
-        self.assertEqual(body["help_url"], "/account/#cardtrader")
-        self.assertEqual(self.recognizer.calls, 0)
-
-    def test_friend_scans_with_admin_token(self):
-        self.client.force_login(self.other)  # no CardTrader token of their own
+    def test_scan_works_without_any_cardtrader_token(self):
+        SyncService.objects.update(api_token="")
+        self.client.force_login(self.other)  # no CardTrader token of their own either
         self.assertEqual(self.call("get", "scan_api_setup").json()["missing"], [])
         session = self.start()
         self.assertEqual(self.capture(session).json()["result"], "added")
+        self.assertEqual(self.ct.calls, [])  # CardTrader is never contacted
 
-    def test_capture_without_service_token_tells_friend_to_ask_admin(self):
-        self.client.force_login(self.other)
+    def test_capture_with_empty_catalog_says_so(self):
         session = self.start()
-        self.set_keys(openrouter="or-key", cardtrader="")
+        Expansion.objects.all().delete()
         body = self.assertError(self.capture(session), 503, "service_missing")
-        self.assertIn("ask the administrator to connect CardTrader", body["detail"])
+        self.assertIn("The card catalog is empty", body["detail"])
         self.assertNotIn("help_url", body)
         self.assertEqual(self.recognizer.calls, 0)
 
@@ -409,14 +395,12 @@ class MissingServicesTest(ScanApiBase):
     def test_setup_lists_missing_services(self):
         self.set_keys(openrouter="", cardtrader="")
         Expansion.objects.all().delete()
-        no_token = CardTraderError("CardTrader API token is not configured.")
-        with mock.patch.object(services, "make_client", side_effect=no_token), \
-                self.assertNoLogs("ledger.api.scan", "WARNING"):
+        with self.assertNoLogs("ledger.api.scan", "WARNING"):
             body = self.call("get", "scan_api_setup").json()
         self.assertEqual(body["warnings"], [])
         self.assertEqual(len(body["missing"]), 1)
-        self.assertIn("CardTrader is not connected", body["missing"][0]["message"])
-        self.assertEqual(body["missing"][0]["url"], "/account/#cardtrader")
+        self.assertIn("The card catalog is empty", body["missing"][0]["message"])
+        self.assertEqual(body["missing"][0]["url"], "")
         self.assertNotIn("OpenRouter", json.dumps(body))
 
 
@@ -431,11 +415,11 @@ class ConfirmTest(ScanApiBase):
         self.assertEqual(body["result"], "confirm")
         line = body["line"]
         self.assertTrue(line["needs_confirmation"])
-        self.assertEqual([c["id"] for c in line["candidates"]], [1201])
+        self.assertEqual([c["id"] for c in line["candidates"]], [cm_id(1201)])
         frame = self.client.get(line["frame_url"])
         self.assertEqual(frame["Content-Type"], "image/jpeg")
         resp = self.call("post", "scan_api_confirm", line["uuid"],
-                         data={"blueprint_id": 1201, "language": "IT", "condition": "EX", "foil": True})
+                         data={"blueprint_id": cm_id(1201), "language": "IT", "condition": "EX", "foil": True})
         confirmed = resp.json()["line"]
         self.assertFalse(confirmed["needs_confirmation"])
         self.assertEqual((confirmed["language"], confirmed["condition"], confirmed["foil"]), ("IT", "EX", True))
@@ -445,19 +429,19 @@ class ConfirmTest(ScanApiBase):
     def test_candidates_say_which_match_the_name_read(self):
         session = self.start()
         dmr = Expansion.objects.get(code="dmr")
-        Blueprint.objects.create(ct_id=1299, expansion=dmr, name="Ponder", collector_number="45")
+        Blueprint.objects.create(cm_product_id=cm_id(1299), expansion=dmr, name="Ponder", collector_number="45")
         self.recognizer.result = Recognition(name="Lotus Petal", set_code="dmr", collector_number="045", language="EN")
         line = self.capture(session).json()["line"]
         self.assertEqual(line["read_name"], "Lotus Petal")
-        self.assertEqual([(c["id"], c["matches_name"]) for c in line["candidates"]], [(1201, False), (1299, False)])
+        self.assertEqual([(c["id"], c["matches_name"]) for c in line["candidates"]], [(cm_id(1201), False), (cm_id(1299), False)])
         self.recognizer.result = Recognition(name="Counterspell", set_code="dmr", collector_number="45", language="")
         line = self.capture(session, "c2").json()["line"]
-        self.assertEqual([(c["id"], c["matches_name"]) for c in line["candidates"]], [(1201, True)])
+        self.assertEqual([(c["id"], c["matches_name"]) for c in line["candidates"]], [(cm_id(1201), True)])
 
     def test_confirm_needs_card_and_language(self):
         session = self.start()
         line = self.uncertain(session)["line"]
-        self.assertInvalid(self.call("post", "scan_api_confirm", line["uuid"], data={"blueprint_id": 1201}),
+        self.assertInvalid(self.call("post", "scan_api_confirm", line["uuid"], data={"blueprint_id": cm_id(1201)}),
                            "language")
         self.assertInvalid(self.call("post", "scan_api_confirm", line["uuid"], data={"blueprint_id": 999999,
                                                                                      "language": "IT"}),
@@ -466,7 +450,7 @@ class ConfirmTest(ScanApiBase):
     def test_confirmed_line_is_returned_unchanged(self):
         session = self.start()
         line = self.capture(session).json()["line"]
-        resp = self.call("post", "scan_api_confirm", line["uuid"], data={"blueprint_id": 1301, "language": "EN"})
+        resp = self.call("post", "scan_api_confirm", line["uuid"], data={"blueprint_id": cm_id(1301), "language": "EN"})
         self.assertEqual(resp.json()["line"], line)
 
     def test_save_blocked_while_cards_need_confirmation(self):
@@ -485,16 +469,16 @@ class SearchTest(ScanApiBase):
         self.assertEqual([b["name"] for b in body["results"]], ["Counterspell"])
         self.assertEqual(body["where"], "dmr")
         resp = self.call("post", "scan_api_manual", session.uuid,
-                         data={"blueprint_id": 1201, "language": "EN", "foil": False})
+                         data={"blueprint_id": cm_id(1201), "language": "EN", "foil": False})
         self.assertEqual(resp.json()["count"], 1)
         self.assertEqual(ScanLine.objects.get(session=session).quantity, 1)
 
     def test_manual_needs_card_and_language(self):
         session = self.start()
-        self.assertInvalid(self.call("post", "scan_api_manual", session.uuid, data={"blueprint_id": 1201}),
+        self.assertInvalid(self.call("post", "scan_api_manual", session.uuid, data={"blueprint_id": cm_id(1201)}),
                            "language")
 
-    def test_search_other_expansion_loads_it(self):
+    def test_search_other_expansion(self):
         session = self.start()  # DMR locked
         resp = self.client.get(reverse("ledger:scan_api_search", args=[session.uuid]), {"q": "sheoldred", "set": "dmu"})
         body = resp.json()
@@ -505,13 +489,6 @@ class SearchTest(ScanApiBase):
         session = self.start()
         resp = self.client.get(reverse("ledger:scan_api_search", args=[session.uuid]), {"q": "counter", "set": "all"})
         self.assertIsNone(resp.json()["where"])
-
-    def test_search_reports_load_failures(self):
-        session = self.start()
-        self.ct.fail_export.add(13)
-        resp = self.client.get(reverse("ledger:scan_api_search", args=[session.uuid]), {"q": "x", "set": "dmu"})
-        self.assertTrue(resp.json()["warnings"])
-
 
 class PhoneTest(ScanApiBase):
     def test_desktop_gets_the_phone_url_of_this_session(self):
@@ -545,7 +522,7 @@ class ReviewTest(ScanApiBase):
         resp = self.call("post", "scan_api_save", session.uuid)
         self.assertEqual(resp.json(), {"saved": 1, "redirect": "/", "messages": [
             {"level": "success", "text": "Saved 1 cards."}]})
-        self.assertTrue(CollectionItem.objects.filter(card__ct_blueprint_id=1201).exists())
+        self.assertTrue(CollectionItem.objects.filter(card__cm_product_id=cm_id(1201)).exists())
 
     def test_threshold_endpoint_is_gone(self):
         with self.assertRaises(NoReverseMatch):
@@ -557,7 +534,7 @@ class ReviewTest(ScanApiBase):
         self.call("post", "scan_api_save", session.uuid)
         self.assertError(self.call("post", "scan_api_save", session.uuid), 409, "closed")
         self.assertError(self.call("post", "scan_api_manual", session.uuid,
-                                   data={"blueprint_id": 1201, "language": "EN"}), 409, "closed")
+                                   data={"blueprint_id": cm_id(1201), "language": "EN"}), 409, "closed")
         self.assertError(self.call("patch", "scan_api_line", line["uuid"], data={"foil": True}), 409, "closed")
         self.assertError(self.call("post", "scan_api_undo", line["uuid"]), 409, "closed")
         self.assertError(self.call("post", "scan_api_confirm", line["uuid"], data={}), 409, "closed")

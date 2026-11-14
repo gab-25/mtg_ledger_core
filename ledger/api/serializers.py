@@ -1,6 +1,6 @@
 """Serializers of the scan API: requests (validation) and responses (also the OpenAPI schema).
 
-Decimals travel as strings ("5.00"). Blueprints are identified by their CardTrader id (ct_id).
+Decimals travel as strings ("5.00"). Blueprints are identified by their Cardmarket product id.
 """
 
 import re
@@ -50,13 +50,17 @@ class ExpansionSerializer(serializers.ModelSerializer):
 
 
 class BlueprintSerializer(serializers.ModelSerializer):
-    id = serializers.IntegerField(source="ct_id", read_only=True, help_text="CardTrader blueprint id")
+    id = serializers.IntegerField(source="cm_product_id", read_only=True, help_text="Cardmarket product id")
+    version = serializers.SerializerMethodField(help_text="Always empty: kept for older clients")
     expansion = ExpansionSerializer(read_only=True)
 
     class Meta:
         model = Blueprint
         fields = ["id", "name", "collector_number", "version", "rarity", "image_url", "expansion"]
         read_only_fields = fields
+
+    def get_version(self, bp) -> str:
+        return ""
 
 
 class CandidateSerializer(BlueprintSerializer):
@@ -94,7 +98,8 @@ class LineSerializer(serializers.ModelSerializer):
     def get_candidates(self, line):
         if not (line.needs_confirmation and line.candidates):
             return []
-        by_id = {b.ct_id: b for b in Blueprint.objects.filter(ct_id__in=line.candidates).select_related("expansion")}
+        by_id = {b.cm_product_id: b for b in
+                 Blueprint.objects.filter(cm_product_id__in=line.candidates).select_related("expansion")}
         return CandidateSerializer([by_id[i] for i in line.candidates if i in by_id], many=True,
                                    context={"read_name": line.read_name}).data
 
@@ -250,12 +255,13 @@ class CaptureSerializer(serializers.Serializer):
 class SearchQuerySerializer(serializers.Serializer):
     q = serializers.CharField(required=False, allow_blank=True, default="", help_text="Part of the card name")
     set = serializers.CharField(required=False, allow_blank=True, default="",
-                                help_text="Expansion code (loaded on demand), 'all', or empty for the session's")
+                                help_text="Expansion code, 'all', or empty for the session's")
 
 
 class PickSerializer(serializers.Serializer):
     blueprint_id = serializers.SlugRelatedField(
-        slug_field="ct_id", queryset=Blueprint.objects.select_related("expansion"), help_text="CardTrader blueprint id",
+        slug_field="cm_product_id", queryset=Blueprint.objects.select_related("expansion"),
+        help_text="Cardmarket product id",
     )
     language = LanguageField()
     foil = serializers.BooleanField(default=False)

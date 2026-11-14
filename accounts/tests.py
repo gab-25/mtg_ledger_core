@@ -37,7 +37,7 @@ class ProfileTest(TestCase):
         data = self.client.get(reverse("accounts:api_account")).json()
         self.assertEqual(data["cardtrader"]["name"], "CardTrader")
         self.assertFalse(data["cardtrader"]["token_saved"])
-        self.assertFalse(data["shares_token"])
+        self.assertNotIn("shares_token", data)
         self.assertIn("Your password must contain at least 8 characters.", data["password_help"])
 
     def test_update_details(self):
@@ -222,12 +222,10 @@ class CardTraderTokenTest(TestCase):
         self.client.logout()
         self.assertIn(self.client.get(self.url).status_code, (401, 403))
 
-    def test_admin_sees_shared_token_warning(self, _):
+    def test_admin_token_is_not_shared(self, _):
         admin = get_user_model().objects.create_superuser("boss", password="pw")
         self.connect("good-token", user=admin)
-        self.assertTrue(self.account()["shares_token"])
-        self.connect("other-good", user=self.friend)
-        self.assertFalse(self.account()["shares_token"])
+        self.assertNotIn("shares_token", self.account())
 
     def test_environment_token_is_not_used(self, _):
         with mock.patch.dict("os.environ", {"CARDTRADER_API_TOKEN": "env-token"}):

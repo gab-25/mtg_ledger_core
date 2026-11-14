@@ -22,7 +22,7 @@ from .cardtrader import (
     money,
 )
 from .openrouter import OpenRouterClient
-from .catalog import blueprint_number, clashing_owners, merge_cards, normalize_number
+from .catalog import blueprint_of, clashing_owners, merge_cards, normalize_number
 from .forms import get_or_create_card
 from .models import (
     Blueprint,
@@ -57,25 +57,6 @@ def user_token(user):
     return service.api_token if service else ""
 
 
-def _service_account():
-    return (
-        SyncService.objects.filter(name=CARDTRADER, user__is_superuser=True)
-        .exclude(api_token="").select_related("user").order_by("user_id").first()
-    )
-
-
-def service_token():
-    """The shared token for the catalog, prices and scanning: the first superuser's own CardTrader token."""
-    service = _service_account()
-    return service.api_token if service else ""
-
-
-def service_account_user():
-    """The administrator whose token is the shared one, or None."""
-    service = _service_account()
-    return service.user if service else None
-
-
 def make_client(token):
     """Build the API client (an empty token raises CardTraderError). Tests patch this to inject a mock transport."""
     return CardTraderClient(token)
@@ -90,10 +71,6 @@ def user_client(user):
     if not token:
         raise CardTraderError(NO_SELLING_TOKEN)
     return make_client(token)
-
-
-def service_client():
-    return make_client(service_token())
 
 
 class TokenInUse(Exception):
@@ -191,14 +168,14 @@ def _choice(value, choices, default, field_name, line):
 
 def link_blueprint(card):
     """Tie a card to its catalog printing by set + collector number, when it has none and one matches."""
-    if card.ct_blueprint_id or not card.collector_number:
+    if card.cm_product_id or not card.collector_number:
         return
     bp = Blueprint.objects.filter(
         expansion__code=card.set_code.lower(), collector_number=normalize_number(card.collector_number)
-    ).order_by("version", "ct_id").first()  # the base printing ("" version) before alternate ones
-    if bp is not None and not Card.objects.filter(ct_blueprint_id=bp.ct_id).exists():
-        card.ct_blueprint_id = bp.ct_id
-        card.save(update_fields=["ct_blueprint_id"])
+    ).order_by("cm_product_id").first()
+    if bp is not None and not Card.objects.filter(cm_product_id=bp.cm_product_id).exists():
+        card.cm_product_id = bp.cm_product_id
+        card.save(update_fields=["cm_product_id"])
 
 
 def import_csv(uploaded_file, owner):
@@ -254,94 +231,142 @@ def import_csv(uploaded_file, owner):
 
 # --- Catalog matching ------------------------------------------------------
 
+def _ct_number(bp):
+    """Collector number of a CardTrader blueprint (export payload), normalised."""
+    return normalize_number((bp.get("fixed_properties") or {}).get("collector_number", ""))
+
+
+def _ct_properties(bp):
+    """Names of the properties CardTrader takes when selling the blueprint; None when it does not say."""
+    props = bp.get("editable_properties")
+    if props is None:
+        return None
+    return [p["name"] for p in props if isinstance(p, dict) and p.get("name")]
+
+
+@dataclass
+class Resolution:
+    """resolve_blueprints(): cards with no CardTrader blueprint, and what CardTrader takes for each blueprint seen."""
+
+    unmatched: list = field(default_factory=list)
+    properties: dict = field(default_factory=dict)  # CardTrader blueprint id -> property names, or None
+
+
+def _ct_expansion(card, by_code, by_name):
+    """The CardTrader expansion id of a card: by its set code, else by its catalog expansion's name."""
+    found = by_code.get(card.set_code.lower())
+    if found is None:
+        bp = blueprint_of(card)
+        if bp is not None:
+            found = by_name.get(bp.expansion.name.casefold())
+    return found
+
+
+def _ct_match(card, exported):
+    """The CardTrader blueprint of a card: by its Cardmarket product, else by number, else by name."""
+    if card.cm_product_id:
+        for bp in exported:
+            if card.cm_product_id in (bp.get("card_market_ids") or []):
+                return bp
+    number = normalize_number(card.collector_number)
+    if number and not number.startswith("CM"):
+        for bp in exported:
+            if _ct_number(bp) == number:
+                return bp
+        return None
+    # Several blueprints can share a name (alternate versions): keep the base one.
+    by_name = None
+    for bp in exported:
+        if bp["name"].casefold() == card.name.casefold() and (by_name is None or (by_name.get("version") and not bp.get("version"))):
+            by_name = bp
+    return by_name
+
+
 def resolve_blueprints(client, cards):
-    """Fill Card.ct_blueprint_id from CardTrader's catalog. Returns cards that could not be matched."""
-    todo = [c for c in cards if not c.ct_blueprint_id]
+    """Fill Card.ct_blueprint_id from the seller's CardTrader catalog, and read what CardTrader takes for products.
+
+    Only the CardTrader expansions of these cards are downloaded; a card whose expansion is not found stays unmatched.
+    """
+    resolution = Resolution()
+    todo = [c for c in cards if not c.ct_blueprint_id or c.is_product]
     if not todo:
-        return []
-    expansions = {
-        e["code"].lower(): e["id"]
-        for e in client.expansions()
-        if e.get("game_id") == MTG_GAME_ID and e.get("code")
-    }
-    unmatched = []
-    by_set = {}
+        return resolution
+    by_code, by_name = {}, {}
+    for e in client.expansions():
+        if e.get("game_id") == MTG_GAME_ID and e.get("code"):
+            by_code.setdefault(e["code"].lower(), e["id"])
+            by_name.setdefault((e.get("name") or "").casefold(), e["id"])
+    by_expansion = {}
     for card in todo:
-        by_set.setdefault(card.set_code.lower(), []).append(card)
-    for set_code, set_cards in by_set.items():
-        expansion_id = expansions.get(set_code)
+        expansion_id = _ct_expansion(card, by_code, by_name)
         if expansion_id is None:
-            unmatched.extend(set_cards)
+            if not card.ct_blueprint_id:
+                resolution.unmatched.append(card)
             continue
-        by_name, by_number = {}, {}
-        for bp in client.blueprints(expansion_id):
-            # Several blueprints can share a name (alternate versions): keep the base one.
-            key = bp["name"].casefold()
-            if key not in by_name or (by_name[key].get("version") and not bp.get("version")):
-                by_name[key] = bp
-            number = blueprint_number(bp)
-            if number:
-                by_number[number] = bp
+        by_expansion.setdefault(expansion_id, []).append(card)
+    for expansion_id, set_cards in by_expansion.items():
+        exported = client.blueprints(expansion_id) or []
         for card in set_cards:
-            if card.collector_number:
-                bp = by_number.get(card.collector_number)
-            else:
-                bp = by_name.get(card.name.casefold())
+            if card.ct_blueprint_id:  # a product already matched: only what it takes is needed
+                known = next((bp for bp in exported if bp["id"] == card.ct_blueprint_id), None)
+                if known is not None:
+                    resolution.properties[known["id"]] = _ct_properties(known)
+                continue
+            bp = _ct_match(card, exported)
             if bp is None:
-                unmatched.append(card)
+                resolution.unmatched.append(card)
                 continue
-            number = blueprint_number(bp) or card.collector_number
-            existing = (
-                Card.objects.exclude(pk=card.pk)
-                .filter(Q(ct_blueprint_id=bp["id"]) | Q(set_code=card.set_code, collector_number=number) & ~Q(collector_number=""))
-                .first()
-            )
-            if existing is not None and existing.ct_blueprint_id not in (None, bp["id"]):
-                _log(f"{card} matches #{number}, already used by {existing} (another printing): fix it by hand",
-                     SyncLog.Level.WARNING)
-                unmatched.append(card)
-                continue
-            if existing is not None:
-                clash = clashing_owners(card, existing)
-                if clash or not merge_cards(card, existing):
-                    # The clash is about someone's listings: only they see it, never in the shared log.
-                    for owner_id in clash:
-                        SyncLog.objects.create(
-                            owner_id=owner_id, level=SyncLog.Level.WARNING,
-                            message=f"{card} duplicates {existing} but both have live listings: merge them by hand"[:300],
-                        )
-                    unmatched.append(card)
-                    continue
-                if not existing.ct_blueprint_id:
-                    existing.ct_blueprint_id = bp["id"]
-                    existing.save(update_fields=["ct_blueprint_id"])
-                continue
-            card.ct_blueprint_id = bp["id"]
-            card.collector_number = number
-            card.save(update_fields=["ct_blueprint_id", "collector_number"])
-    return unmatched
+            resolution.properties[bp["id"]] = _ct_properties(bp)
+            if not _link_ct_blueprint(card, bp):
+                resolution.unmatched.append(card)
+    return resolution
+
+
+def _link_ct_blueprint(card, bp):
+    """Store bp as the card's CardTrader blueprint, folding a duplicate of the same printing. False if it can't."""
+    number = normalize_number(card.collector_number) or _ct_number(bp)
+    existing = (
+        Card.objects.exclude(pk=card.pk)
+        .filter(Q(ct_blueprint_id=bp["id"]) | Q(set_code=card.set_code, collector_number=number) & ~Q(collector_number=""))
+        .first()
+    )
+    if existing is not None and existing.ct_blueprint_id not in (None, bp["id"]):
+        _log(f"{card} matches #{number}, already used by {existing} (another printing): fix it by hand",
+             SyncLog.Level.WARNING)
+        return False
+    if existing is not None:
+        clash = clashing_owners(card, existing)
+        if clash or not merge_cards(card, existing):
+            # The clash is about someone's listings: only they see it, never in the shared log.
+            for owner_id in clash:
+                SyncLog.objects.create(
+                    owner_id=owner_id, level=SyncLog.Level.WARNING,
+                    message=f"{card} duplicates {existing} but both have live listings: merge them by hand"[:300],
+                )
+            return False
+        if not existing.ct_blueprint_id:
+            existing.ct_blueprint_id = bp["id"]
+            existing.save(update_fields=["ct_blueprint_id"])
+        return True
+    card.ct_blueprint_id = bp["id"]
+    card.collector_number = number
+    card.save(update_fields=["ct_blueprint_id", "collector_number"])
+    return True
 
 
 # --- Listings ------------------------------------------------------------
 
-def _blueprints(listings):
-    """{ct_id: Blueprint} of the listings' cards, to know what CardTrader accepts for each."""
-    ids = {l.item.card.ct_blueprint_id for l in listings if l.item.card.ct_blueprint_id}
-    return {bp.ct_id: bp for bp in Blueprint.objects.filter(ct_id__in=ids)}
+def product_payload(listing, accepted=None):
+    """The CardTrader product for a listing; products (sealed, accessories) send only what CardTrader takes for them.
 
-
-def _accepts(blueprint, prop):
-    return blueprint is None or blueprint.accepts(prop)
-
-
-def product_payload(listing, blueprint=None):
-    """The CardTrader product for a listing; products (sealed, accessories) send only what their blueprint takes."""
+    accepted: the property names CardTrader takes for the blueprint, None when unknown (language only, then).
+    """
     item = listing.item
     if item.card.is_product:
         properties = {}
-        if _accepts(blueprint, "mtg_language"):
+        if accepted is None or "mtg_language" in accepted:
             properties["mtg_language"] = LANGUAGE_TO_CT[item.language]
-        if blueprint is not None and blueprint.accepts("condition"):
+        if accepted is not None and "condition" in accepted:
             properties["condition"] = CONDITION_TO_CT[item.condition]
     else:
         properties = {
@@ -388,7 +413,8 @@ def publish_pending(user):
         return result
 
     with user_client(user) as client:
-        unmatched = {c.pk for c in resolve_blueprints(client, {l.item.card for l in listings})}
+        resolution = resolve_blueprints(client, {l.item.card for l in listings})
+        unmatched = {c.pk for c in resolution.unmatched}
         # Resolution may merge duplicate printings: reload so listings point at the surviving cards.
         listings = list(
             Listing.objects.filter(pk__in=[l.pk for l in listings]).select_related("item__card")
@@ -405,8 +431,8 @@ def publish_pending(user):
         for batch, call in ((to_create, client.bulk_create), (to_update, client.bulk_update)):
             if not batch:
                 continue
-            blueprints = _blueprints(batch)
-            outcomes = call([product_payload(l, blueprints.get(l.item.card.ct_blueprint_id)) for l in batch])
+            outcomes = call([product_payload(l, resolution.properties.get(l.item.card.ct_blueprint_id))
+                             for l in batch])
             for listing, outcome in zip(batch, outcomes):
                 if outcome.get("result") in ("ok", "warning") and outcome.get("product_id"):
                     listing.ct_product_id = outcome["product_id"]

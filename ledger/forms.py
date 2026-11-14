@@ -23,7 +23,7 @@ PRODUCT_CONDITION = Condition.NEAR_MINT  # stored on products, which have no con
 class CatalogItemForm(forms.Form):
     """Adds copies of a catalog product (card, sealed or accessory) to the owner's collection."""
 
-    blueprint = forms.IntegerField(label="CardTrader blueprint", min_value=1)
+    blueprint = forms.IntegerField(label="Cardmarket product", min_value=1)
     condition = forms.ChoiceField(choices=Condition.choices, initial=Condition.NEAR_MINT, required=False)
     language = forms.ChoiceField(choices=Language.choices, initial=Language.EN, required=False)
     foil = forms.BooleanField(required=False)
@@ -34,7 +34,7 @@ class CatalogItemForm(forms.Form):
         self.owner = owner
 
     def clean_blueprint(self):
-        bp = Blueprint.objects.select_related("expansion", "category").filter(ct_id=self.cleaned_data["blueprint"]).first()
+        bp = Blueprint.objects.select_related("expansion", "category").filter(cm_product_id=self.cleaned_data["blueprint"]).first()
         if bp is None:
             raise forms.ValidationError("Unknown catalog product.")
         return bp
@@ -46,8 +46,6 @@ class CatalogItemForm(forms.Form):
         condition, language, foil = data["condition"] or Condition.NEAR_MINT, data["language"] or Language.EN, data["foil"]
         if bp.is_product:
             condition, foil = PRODUCT_CONDITION, False
-            if not bp.accepts("mtg_language"):
-                language = Language.EN
         card = catalog.card_for_blueprint(bp)
         stack = {"owner": self.owner, "card": card, "condition": condition, "language": language, "foil": foil}
         # Older rows may hold duplicate stacks (the free-text form never merged): the oldest gets the copies.

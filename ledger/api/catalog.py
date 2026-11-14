@@ -1,7 +1,7 @@
-"""The catalog API (/api/catalog/): search every CardTrader product (cards, sealed, accessories) with Cardmarket
+"""The catalog API (/api/catalog/): search every Cardmarket product (cards, sealed, accessories) with Cardmarket
 prices and owned copies."""
 
-from django.db.models import Max
+from django.db.models import F, Max
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 
@@ -49,40 +49,41 @@ def catalog(request):
     searched = bool(q or set_code or number or category is not None or owned)
 
     owned_qty = cardmarket.owned_quantities(request.user)
-    printings = Blueprint.objects.select_related("expansion", "cm_price", "category")
+    # Prices are prefetched: a join would turn INNER once filtered on cm_product_id, hiding unpriced printings.
+    printings = Blueprint.objects.select_related("expansion", "category").prefetch_related("cm_product")
     if searched:
         printings = printings.order_by("name", "expansion__code")
     else:
-        # Latest releases: Expansion has no release date, and CardTrader ids grow over time (not strictly by
-        # release), so the newest expansion is the one with the highest CardTrader id.
-        printings = printings.order_by("-expansion__ct_id", "name", "expansion__code", "ct_id")
+        # Latest releases first (Scryfall's release date).
+        printings = printings.order_by(F("expansion__released_at").desc(nulls_last=True), "name", "expansion__code",
+                                       "cm_product_id")
     if set_code:
         printings = printings.filter(expansion__code=set_code)
     if number:
         printings = printings.filter(collector_number=number)
     if category is not None:
-        printings = printings.filter(category__ct_id=category)
+        printings = printings.filter(category__cm_id=category)
     if owned:
-        printings = printings.filter(ct_id__in=owned_qty)
+        printings = printings.filter(cm_product_id__in=owned_qty)
     if q:
         printings = search_blueprints(printings, q)  # orders by relevance
 
     def printing(bp):
-        price = bp.cm_price
+        price = bp.cm_product
         return {
-            "ct_id": bp.ct_id,
+            "ct_id": bp.cm_product_id,  # the name the UI knows: now the Cardmarket product id
             "name": bp.name,
-            "version": bp.version,
+            "version": "",
             "image_url": bp.image_url,
             "image_large_url": bp.image_large_url,
             "expansion_code": bp.expansion.code,
             "expansion_name": bp.expansion.name,
             "collector_number": bp.collector_number,
-            "category_id": bp.category.ct_id if bp.category else None,
+            "category_id": bp.category.cm_id if bp.category else None,
             "category_name": bp.category.name if bp.category else None,
             "is_product": bp.is_product,
-            "accepts_language": bp.accepts("mtg_language"),
-            "owned_qty": owned_qty.get(bp.ct_id),
+            "accepts_language": True,  # what CardTrader takes is checked when publishing
+            "owned_qty": owned_qty.get(bp.cm_product_id),
             "prices": None if price is None else {f: _money(getattr(price, f)) for f in PRICE_FIELDS},
         }
 
@@ -94,8 +95,8 @@ def catalog(request):
     })
 
 
-@doc(TAGS, "The CardTrader categories that have products in the catalog, for the category filter")
+@doc(TAGS, "The Cardmarket categories that have products in the catalog, for the category filter")
 @api_view(["GET"])
 def categories(request):
-    rows = Category.objects.filter(blueprints__isnull=False).distinct().order_by("name", "ct_id")
-    return Response([{"id": c.ct_id, "name": c.name} for c in rows])
+    rows = Category.objects.filter(blueprints__isnull=False).distinct().order_by("name", "cm_id")
+    return Response([{"id": c.cm_id, "name": c.name} for c in rows])
