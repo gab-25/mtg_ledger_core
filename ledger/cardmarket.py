@@ -4,6 +4,7 @@ Each CardTrader blueprint carries its Cardmarket product ids, which tie it to a 
 downloaded by the nightly catalog sync (ledger/catalog_sync.py).
 """
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
@@ -13,6 +14,10 @@ from .catalog import normalize_number
 from .models import Blueprint, Card, CardmarketPrice
 
 PRICE_GUIDE_URL = "https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_1.json"
+PRODUCT_LIST_URLS = (
+    "https://downloads.s3.cardmarket.com/productCatalog/productList/products_singles_1.json",
+    "https://downloads.s3.cardmarket.com/productCatalog/productList/products_nonsingles_1.json",
+)
 USER_AGENT = "mtg-ledger/0.1"
 
 # Price guide key -> CardmarketPrice field
@@ -25,6 +30,17 @@ PRICE_FIELDS = {
 
 class CardmarketError(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class CmProduct:
+    """A row of Cardmarket's product lists: a single card, a sealed product or an accessory."""
+
+    id_product: int
+    name: str
+    id_category: int
+    category_name: str
+    id_expansion: int
 
 
 def make_client(transport=None):
@@ -106,6 +122,24 @@ def fetch_guide(client):
     except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise CardmarketError(f"Cardmarket price guide: {type(exc).__name__}: {exc}") from exc
     return prices, guide_date
+
+
+def fetch_products(client):
+    """[CmProduct] of every MTG single and non-single in Cardmarket's public product lists."""
+    products = []
+    try:
+        for url in PRODUCT_LIST_URLS:
+            response = client.get(url)
+            response.raise_for_status()
+            for p in response.json()["products"]:
+                products.append(CmProduct(
+                    int(p["idProduct"]), p["name"], int(p["idCategory"]), p.get("categoryName") or "",
+                    int(p["idExpansion"]),
+                ))
+            del response
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise CardmarketError(f"Cardmarket products: {type(exc).__name__}: {exc}") from exc
+    return products
 
 
 def price_row(id_product, values, guide_date):

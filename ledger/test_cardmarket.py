@@ -24,6 +24,45 @@ GUIDE = {
 CM_IDS = {1001: [555001], 1201: [555201, 555202], 1002: []}
 
 
+SINGLES = {"version": 1, "createdAt": "2026-11-14T12:00:09+0100", "products": [
+    {"idProduct": 501201, "name": "Counterspell", "idCategory": 1, "categoryName": "Magic Single",
+     "idExpansion": 77, "idMetacard": 1, "dateAdded": "2022-01-01 00:00:00"},
+]}
+NONSINGLES = {"version": 1, "createdAt": "2026-11-14T12:00:14+0100", "products": [
+    {"idProduct": 501390, "name": "Dominaria United Draft Booster Box", "idCategory": 5,
+     "categoryName": "Magic Display", "idExpansion": 78, "idMetacard": 0, "dateAdded": "2022-09-01 00:00:00"},
+]}
+
+
+def product_lists_client(singles=SINGLES, nonsingles=NONSINGLES):
+    files = dict(zip(cardmarket.PRODUCT_LIST_URLS, (singles, nonsingles)))
+
+    def handler(request):
+        body = files.get(str(request.url))
+        if body is None:
+            return httpx.Response(404)
+        return httpx.Response(200, json=body)
+
+    return cardmarket.make_client(transport=httpx.MockTransport(handler))
+
+
+class ProductListTest(TestCase):
+    def test_fetch_products_reads_both_lists(self):
+        products = cardmarket.fetch_products(product_lists_client())
+        self.assertEqual(products, [
+            cardmarket.CmProduct(501201, "Counterspell", 1, "Magic Single", 77),
+            cardmarket.CmProduct(501390, "Dominaria United Draft Booster Box", 5, "Magic Display", 78),
+        ])
+
+    def test_fetch_products_malformed_raises(self):
+        with self.assertRaises(cardmarket.CardmarketError):
+            cardmarket.fetch_products(product_lists_client(nonsingles={"products": [{"name": "x"}]}))
+
+    def test_fetch_products_http_error_raises(self):
+        with self.assertRaises(cardmarket.CardmarketError):
+            cardmarket.fetch_products(product_lists_client(singles=None))
+
+
 class FakeGuide:
     """Cardmarket's price guide file, served through httpx.MockTransport."""
 
