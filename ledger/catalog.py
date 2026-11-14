@@ -161,11 +161,20 @@ def _fold(source, target, result):
     return True
 
 
+def _same_printing(a, b):
+    """Two cards on one Cardmarket product are the same printing unless both carry different real numbers."""
+    na, nb = normalize_number(a.collector_number), normalize_number(b.collector_number)
+    stand_in = ("CT", "CM")
+    return not na or not nb or na == nb or na.startswith(stand_in) or nb.startswith(stand_in)
+
+
 def reconcile_cards():
     """Align the Ledger's cards with the catalog: link, fold duplicates, take the catalog's set code and number.
 
     1. a card with no Cardmarket product is linked by set code + collector number;
-    2. cards on the same product fold into the oldest (unless live listings clash: the newer one is unlinked);
+    2. cards on the same product fold into the oldest when they are the same printing; otherwise (different real
+       numbers, e.g. base and showcase that CardTrader tied to one Cardmarket product), or when live listings
+       clash, the newer one is unlinked;
     3. a linked card takes its printing's set code, collector number (or CM stand-in) and product flag; when another
        card already holds them, the two fold.
     """
@@ -183,7 +192,7 @@ def reconcile_cards():
     for cm in list(duplicated):
         target, *sources = Card.objects.filter(cm_product_id=cm).order_by("pk")
         for source in sources:
-            if not _fold(source, target, result):
+            if not _same_printing(source, target) or not _fold(source, target, result):
                 source.cm_product_id = None
                 source.save(update_fields=["cm_product_id"])
 
@@ -192,6 +201,12 @@ def reconcile_cards():
                  Blueprint.objects.select_related("expansion", "category").filter(cm_product_id__in=linked_ids)}
     for card in Card.objects.filter(cm_product_id__in=list(printings)).order_by("pk"):
         bp = printings[card.cm_product_id]
+        if not bp.collector_number and not bp.is_product and card.collector_number:
+            # a single Scryfall gives no number for: the card's own set code and number are the better identity
+            if card.is_product:
+                card.is_product = False
+                card.save(update_fields=["is_product"])
+            continue
         set_code, number = bp.expansion.code.upper(), bp.collector_number or stand_in_number(bp.cm_product_id)
         if (card.set_code, card.collector_number, card.is_product) == (set_code, number, bp.is_product):
             continue

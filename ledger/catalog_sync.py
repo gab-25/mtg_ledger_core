@@ -17,6 +17,9 @@ from .models import CARD_CATEGORY_ID, Blueprint, CardmarketPrice, Category, Expa
 from .scryfall import ScryfallError
 
 BATCH = 2000
+# Blueprints missing from the files are removed only when the download holds at least this share of the catalog:
+# a truncated or emptied file must not wipe it.
+PRUNE_MIN_SHARE = 0.5
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,7 @@ class SyncResult:
     blueprints: int
     priced: int
     skipped: int
+    pruned: int
     reconciled: catalog.ReconcileResult
     guide_date: datetime
 
@@ -67,12 +71,28 @@ def _rows(products, cards):
     return rows, skipped
 
 
+def _prune(written):
+    """Remove the blueprints the files no longer hold (not those an open scan line uses). Returns how many went."""
+    from .models import ScanLine, ScanSession
+
+    stale = Blueprint.objects.exclude(cm_product_id__in=written)
+    in_use = ScanLine.objects.filter(session__status=ScanSession.Status.OPEN).exclude(blueprint=None)
+    stale = stale.exclude(pk__in=in_use.values("blueprint_id"))
+    ScanLine.objects.filter(blueprint__in=stale).update(blueprint=None)  # saved sessions keep their history
+    return stale.delete()[1].get("ledger.Blueprint", 0)
+
+
 def _write(rows, categories, sets, prices, guide_date):
-    """Write the catalog and the prices in one transaction; expansions and categories left empty go."""
+    """Write the catalog and the prices in one transaction; stale blueprints, empty expansions and categories go.
+
+    Returns how many blueprints were pruned.
+    """
     from django.db import transaction
 
     codes = {r[2] for r in rows}
+    pruned = 0
     with transaction.atomic():
+        prune = len(rows) >= PRUNE_MIN_SHARE * Blueprint.objects.count()
         Expansion.objects.bulk_create(
             [Expansion(code=code, name=sets[code].name if code in sets else code.upper(),
                        released_at=sets[code].released_at if code in sets else None) for code in sorted(codes)],
@@ -103,8 +123,13 @@ def _write(rows, categories, sets, prices, guide_date):
                 update_conflicts=True, unique_fields=["id_product"],
                 update_fields=[*PRICE_FIELDS.values(), "prices_date"],
             )
+        if prune:
+            pruned = _prune([r[0] for r in rows])
+        else:
+            logger.warning("Catalog sync: %s printings downloaded, too few to prune the catalog", len(rows))
         Category.objects.filter(blueprints__isnull=True).delete()
         Expansion.objects.filter(blueprints__isnull=True).delete()
+    return pruned
 
 
 def sync(cm_client, sf_client):
@@ -120,10 +145,10 @@ def sync(cm_client, sf_client):
     del cards
     categories = {p.id_category: p.category_name for p in products}
     del products
-    _write(rows, categories, sets, prices, guide_date)
+    pruned = _write(rows, categories, sets, prices, guide_date)
     return SyncResult(
         expansions=len({r[2] for r in rows}), blueprints=len(rows), priced=sum(1 for r in rows if r[0] in prices),
-        skipped=skipped, reconciled=catalog.reconcile_cards(), guide_date=guide_date,
+        skipped=skipped, pruned=pruned, reconciled=catalog.reconcile_cards(), guide_date=guide_date,
     )
 
 
@@ -135,6 +160,8 @@ def _summary(result):
     )
     if result.skipped:
         message += f", {result.skipped} products without set"
+    if result.pruned:
+        message += f", {result.pruned} printings removed"
     if r.clashes:
         message += f", {r.clashes} duplicates to merge by hand"
     return message

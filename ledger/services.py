@@ -330,9 +330,13 @@ def _link_ct_blueprint(card, bp):
         .filter(Q(ct_blueprint_id=bp["id"]) | Q(set_code=card.set_code, collector_number=number) & ~Q(collector_number=""))
         .first()
     )
-    if existing is not None and existing.ct_blueprint_id not in (None, bp["id"]):
-        _log(f"{card} matches #{number}, already used by {existing} (another printing): fix it by hand",
-             SyncLog.Level.WARNING)
+    other_printing = existing is not None and (
+        existing.ct_blueprint_id not in (None, bp["id"])
+        or None not in (existing.cm_product_id, card.cm_product_id) and existing.cm_product_id != card.cm_product_id
+    )
+    if other_printing:
+        _log(f"{card} matches CardTrader blueprint {bp['id']}, already used by {existing} (another printing): "
+             f"fix it by hand"[:300], SyncLog.Level.WARNING)
         return False
     if existing is not None:
         clash = clashing_owners(card, existing)

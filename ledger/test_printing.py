@@ -124,6 +124,17 @@ class ResolvePrintingTest(LedgerTestCase):
         card.refresh_from_db()
         self.assertEqual(card.ct_blueprint_id, 1301)
 
+    def test_resolve_never_folds_two_cardmarket_products(self):
+        self.ct.blueprints[11][0]["card_market_ids"] = [cm_id(1101), 777]  # CardTrader lumps two products
+        first = Card.objects.create(name="Fable of the Mirror-Breaker", set_code="NEO", collector_number="356",
+                                    cm_product_id=cm_id(1101), ct_blueprint_id=1101)
+        other = Card.objects.create(name="Fable of the Mirror-Breaker", set_code="NEO", collector_number="356A",
+                                    cm_product_id=777)
+        CollectionItem.objects.create(owner=self.user, card=other, condition="NM", language="EN", quantity=1)
+        self.assertEqual(self.resolve([other]), [other])
+        self.assertTrue(Card.objects.filter(pk=other.pk, ct_blueprint_id__isnull=True).exists())
+        self.assertTrue(Card.objects.filter(pk=first.pk).exists())
+
     def test_resolve_unknown_expansion_stays_unmatched(self):
         card = Card.objects.create(name="Mystery", set_code="ZZZ", collector_number="1", cm_product_id=1)
         self.assertEqual(self.resolve([card]), [card])

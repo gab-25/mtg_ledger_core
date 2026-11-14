@@ -174,6 +174,44 @@ class SyncTest(CatalogSyncTestCase):
         self.assertIn("cards linked", log.message)
 
 
+class PruneTest(CatalogSyncTestCase):
+    def old_blueprint(self, cm, **fields):
+        old = Expansion.objects.get_or_create(code="ctold", defaults={"name": "Old CardTrader set"})[0]
+        return Blueprint.objects.create(cm_product_id=cm, expansion=old, name="Old lot", **fields)
+
+    def test_blueprints_no_longer_in_the_files_are_removed(self):
+        self.old_blueprint(888001)
+        self.sync()
+        self.assertFalse(Blueprint.objects.filter(cm_product_id=888001).exists())
+        self.assertFalse(Expansion.objects.filter(code="ctold").exists())
+
+    def test_blueprint_of_an_open_scan_line_is_kept(self):
+        from .models import ScanLine, ScanSession
+
+        bp = self.old_blueprint(888002)
+        session = ScanSession.objects.create(owner=self.user)
+        ScanLine.objects.create(session=session, blueprint=bp, condition="NM", language="EN")
+        self.sync()
+        self.assertTrue(Blueprint.objects.filter(cm_product_id=888002).exists())
+
+    def test_saved_scan_line_keeps_its_history_without_the_blueprint(self):
+        from .models import ScanLine, ScanSession
+
+        bp = self.old_blueprint(888003)
+        session = ScanSession.objects.create(owner=self.user, status=ScanSession.Status.SAVED)
+        line = ScanLine.objects.create(session=session, blueprint=bp, condition="NM", language="EN")
+        self.sync()
+        line.refresh_from_db()
+        self.assertIsNone(line.blueprint)
+
+    def test_suspiciously_small_download_prunes_nothing(self):
+        for i in range(20):
+            self.old_blueprint(889000 + i)
+        result = self.sync()
+        self.assertEqual(Blueprint.objects.filter(cm_product_id__gte=889000).count(), 20)
+        self.assertFalse(result.pruned)
+
+
 class ReconcileTest(CatalogSyncTestCase):
     def setUp(self):
         super().setUp()
@@ -237,6 +275,23 @@ class ReconcileTest(CatalogSyncTestCase):
         card.refresh_from_db()
         self.assertEqual((card.cm_product_id, card.collector_number), (501201, "45"))
         self.assertGreaterEqual(result.linked, 1)
+
+    def test_single_without_scryfall_number_keeps_its_own(self):
+        card = Card.objects.create(name="Brainstorm", set_code="2XM", collector_number="129", cm_product_id=UNMATCHED)
+        catalog.reconcile_cards()
+        card.refresh_from_db()
+        self.assertEqual((card.set_code, card.collector_number), ("2XM", "129"))
+
+    def test_duplicate_product_with_different_numbers_is_unlinked_not_merged(self):
+        base = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="45", cm_product_id=501201)
+        showcase = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="300",
+                                       cm_product_id=501201)
+        self.stack(showcase, 2)
+        catalog.reconcile_cards()
+        showcase.refresh_from_db()
+        self.assertIsNone(showcase.cm_product_id)
+        self.assertEqual(showcase.items.get().quantity, 2)
+        self.assertTrue(Card.objects.filter(pk=base.pk, cm_product_id=501201).exists())
 
     def test_card_with_unknown_product_stays_as_is(self):
         card = Card.objects.create(name="Gone", set_code="OLD", collector_number="CT1", cm_product_id=424242)
