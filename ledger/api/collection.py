@@ -28,14 +28,14 @@ ITEM = form_body("Item", ItemForm)
 
 def _blueprint_value(field):
     """The value of a field of the item's catalog blueprint (None when the card has none)."""
-    return Subquery(Blueprint.objects.filter(ct_id=OuterRef("card__ct_blueprint_id")).values(field)[:1])
+    return Subquery(Blueprint.objects.filter(cm_product_id=OuterRef("card__cm_product_id")).values(field)[:1])
 
 
 def trend_price():
     """The Cardmarket trend of the item's printing (trend_foil for a foil card), None when unknown or 0.00."""
     trend = Case(
-        When(foil=True, card__is_product=False, then=_blueprint_value("cm_price__trend_foil")),
-        default=_blueprint_value("cm_price__trend"),
+        When(foil=True, card__is_product=False, then=_blueprint_value("cm_product__trend_foil")),
+        default=_blueprint_value("cm_product__trend"),
         output_field=DecimalField(max_digits=10, decimal_places=2),
     )
     return NullIf(trend, Value(Decimal("0.00")))
@@ -46,7 +46,7 @@ def _price(item):
 
 
 def _with_blueprint(items):
-    return items.annotate(category_ct_id=_blueprint_value("category__ct_id"),
+    return items.annotate(category_ct_id=_blueprint_value("category__cm_id"),
                           category_name=_blueprint_value("category__name"),
                           image_url=_blueprint_value("image_url"),
                           image_large_url=_blueprint_value("image_large_url"),
@@ -122,15 +122,16 @@ def _collection(request):
         items = items.filter(condition=cond)
     if category is not None:
         items = items.filter(category_ct_id=category)
-    owned_blueprints = Card.objects.filter(items__owner=user, ct_blueprint_id__isnull=False).values("ct_blueprint_id")
-    categories = Category.objects.filter(blueprints__ct_id__in=owned_blueprints).distinct().order_by("name", "ct_id")
+    owned_products = Card.objects.filter(items__owner=user, cm_product_id__isnull=False).values("cm_product_id")
+    categories = (Category.objects.filter(blueprints__cm_product_id__in=owned_products).distinct()
+                  .order_by("name", "cm_id"))
 
     return Response({
         **page_payload(request, items, _row),
         "stats": stats,
         "sets": list(Card.objects.filter(items__owner=user).values_list("set_code", flat=True)
                      .distinct().order_by("set_code")),
-        "categories": [{"id": c.ct_id, "name": c.name} for c in categories],
+        "categories": [{"id": c.cm_id, "name": c.name} for c in categories],
         "filtered": bool(q or foil or set_code or cond or category is not None),
     })
 

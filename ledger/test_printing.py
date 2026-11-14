@@ -4,10 +4,10 @@ from django.urls import reverse
 
 from decimal import Decimal
 
-from . import services
+from . import catalog, services
 from .catalog import merge_cards, normalize_number
-from .models import Card, CollectionItem, Listing, SyncLog
-from .tests import LedgerTestCase
+from .models import Blueprint, Card, CollectionItem, Expansion, Listing, SyncLog
+from .tests import LedgerTestCase, cm_id, load_catalog
 
 
 class PrintingModelTest(LedgerTestCase):
@@ -33,17 +33,12 @@ class PrintingModelTest(LedgerTestCase):
 
 class PrintingFormCsvTest(LedgerTestCase):
     def test_catalog_add_targets_printing(self):
-        from . import catalog
-        from .models import Expansion
-
-        client = self.ct.client()
-        catalog.sync_expansions(client)
-        catalog.ensure_blueprints(client, Expansion.objects.get(ct_id=11))
+        load_catalog()
         resp = self.client.post(reverse("ledger:api_collection"), {
-            "blueprint": 1101, "condition": "NM", "language": "EN", "quantity": 1, "price": "10.00",
+            "blueprint": cm_id(1101), "condition": "NM", "language": "EN", "quantity": 1, "price": "10.00",
         }, content_type="application/json")
         self.assertEqual(resp.status_code, 201)
-        self.assertTrue(Card.objects.filter(set_code="NEO", collector_number="356", ct_blueprint_id=1101).exists())
+        self.assertTrue(Card.objects.filter(set_code="NEO", collector_number="356", cm_product_id=cm_id(1101)).exists())
 
     def test_csv_number_column_roundtrip(self):
         upload = SimpleUploadedFile("c.csv", b"name,set,number,quantity\nFable of the Mirror-Breaker,neo,141,2\n")
@@ -63,7 +58,7 @@ class PrintingFormCsvTest(LedgerTestCase):
 
 class ResolvePrintingTest(LedgerTestCase):
     def resolve(self, cards):
-        return services.resolve_blueprints(self.ct.client(), cards)
+        return services.resolve_blueprints(self.ct.client(), cards).unmatched
 
     def test_resolve_by_number_picks_showcase(self):
         card = Card.objects.create(name="Fable of the Mirror-Breaker", set_code="NEO", collector_number="356")
@@ -111,6 +106,47 @@ class ResolvePrintingTest(LedgerTestCase):
         legacy = Card.objects.get(name="Counterspell", set_code="DMR", collector_number="")
         self.assertEqual(self.resolve([legacy]), [legacy])
         self.assertTrue(Card.objects.filter(pk=legacy.pk, ct_blueprint_id__isnull=True).exists())
+
+
+    def test_resolve_by_cardmarket_product(self):
+        card = Card.objects.create(name="Fable of the Mirror-Breaker", set_code="NEO", collector_number="999",
+                                   cm_product_id=cm_id(1101))
+        self.assertEqual(self.resolve([card]), [])
+        card.refresh_from_db()
+        self.assertEqual((card.ct_blueprint_id, card.collector_number), (1101, "999"))
+
+    def test_resolve_finds_expansion_by_catalog_name(self):
+        load_catalog()
+        Expansion.objects.filter(code="dmu").update(code="xdmu")
+        card = Card.objects.create(name="Sheoldred, the Apocalypse", set_code="XDMU", collector_number="107",
+                                   cm_product_id=cm_id(1301))
+        self.assertEqual(self.resolve([card]), [])
+        card.refresh_from_db()
+        self.assertEqual(card.ct_blueprint_id, 1301)
+
+    def test_resolve_never_folds_two_cardmarket_products(self):
+        self.ct.blueprints[11][0]["card_market_ids"] = [cm_id(1101), 777]  # CardTrader lumps two products
+        first = Card.objects.create(name="Fable of the Mirror-Breaker", set_code="NEO", collector_number="356",
+                                    cm_product_id=cm_id(1101), ct_blueprint_id=1101)
+        other = Card.objects.create(name="Fable of the Mirror-Breaker", set_code="NEO", collector_number="356A",
+                                    cm_product_id=777)
+        CollectionItem.objects.create(owner=self.user, card=other, condition="NM", language="EN", quantity=1)
+        self.assertEqual(self.resolve([other]), [other])
+        self.assertTrue(Card.objects.filter(pk=other.pk, ct_blueprint_id__isnull=True).exists())
+        self.assertTrue(Card.objects.filter(pk=first.pk).exists())
+
+    def test_resolve_unknown_expansion_stays_unmatched(self):
+        card = Card.objects.create(name="Mystery", set_code="ZZZ", collector_number="1", cm_product_id=1)
+        self.assertEqual(self.resolve([card]), [card])
+        self.assertNotIn(("GET", "/blueprints/export"), self.ct.calls)
+
+    def test_resolve_reads_product_properties_of_matched_products(self):
+        load_catalog()
+        box = catalog.card_for_blueprint(Blueprint.objects.get(cm_product_id=cm_id(1390)))
+        box.ct_blueprint_id = 1390
+        box.save()
+        resolution = services.resolve_blueprints(self.ct.client(), [box])
+        self.assertEqual(resolution.properties, {1390: ["mtg_language"]})
 
 
 class MergeClashLogTest(LedgerTestCase):

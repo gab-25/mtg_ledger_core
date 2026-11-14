@@ -1,31 +1,23 @@
 from decimal import Decimal
-from unittest import mock
 
-from . import catalog, scan
+from . import scan
 from .models import Blueprint, Card, CollectionItem, Expansion, Listing, ScanLine, SyncLog
 from .recognition import Match, Recognition
-from .tests import LedgerTestCase
+from .tests import LedgerTestCase, cm_id, load_catalog
 
 
 class ScanTestCase(LedgerTestCase):
-    price = Decimal("5.00")
-
     def setUp(self):
         super().setUp()
-        self.api = self.ct.client()
-        catalog.sync_expansions(self.api)
+        load_catalog()
         self.dmr = Expansion.objects.get(code="dmr")
-        catalog.ensure_blueprints(self.api, self.dmr)
-        self.bolt = Blueprint.objects.get(ct_id=1201)  # Counterspell DMR #45
-        patcher = mock.patch("ledger.pricing.price_for", side_effect=lambda *a, **k: self.price)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.bolt = Blueprint.objects.get(cm_product_id=cm_id(1201))  # Counterspell DMR #45
         self.session = scan.start_session(self.user, self.dmr, "NM")
 
     def capture(self, capture_id, *, language="IT", foil=False, certain=True):
         rec = Recognition(name="Counterspell", language=language, foil=foil)
         m = Match(self.bolt, [self.bolt], "ok") if certain else Match(None, [self.bolt], "ambiguous")
-        return scan.add_capture(self.session, self.api, rec, m, frame=b"jpeg", capture_id=capture_id)
+        return scan.add_capture(self.session, rec, m, frame=b"jpeg", capture_id=capture_id)
 
 
 class CaptureTest(ScanTestCase):
@@ -39,7 +31,7 @@ class CaptureTest(ScanTestCase):
         self.capture("a")
         line, merged = self.capture("b")
         self.assertTrue(merged)
-        self.assertEqual((self.session.lines.count(), line.quantity, line.price), (1, 2, Decimal("5.00")))
+        self.assertEqual((self.session.lines.count(), line.quantity), (1, 2))
 
     def test_different_language_is_a_new_line(self):
         self.capture("a")
@@ -49,7 +41,7 @@ class CaptureTest(ScanTestCase):
     def test_uncertain_capture_kept_with_frame(self):
         line, _ = self.capture("a", certain=False)
         self.assertTrue(line.needs_confirmation)
-        self.assertEqual((bytes(line.frame), line.candidates, line.blueprint), (b"jpeg", [1201], None))
+        self.assertEqual((bytes(line.frame), line.candidates, line.blueprint), (b"jpeg", [cm_id(1201)], None))
 
     def test_undo_and_confirm(self):
         line, _ = self.capture("a")
@@ -61,10 +53,9 @@ class CaptureTest(ScanTestCase):
         scan.undo(line)
         self.assertFalse(ScanLine.objects.filter(pk=line.pk).exists())
         pending, _ = self.capture("c", certain=False)
-        confirmed = scan.confirm_line(pending, self.api, self.bolt, "IT")
+        confirmed = scan.confirm_line(pending, self.bolt, "IT")
         self.assertFalse(confirmed.needs_confirmation)
         self.assertIsNone(confirmed.frame)
-        self.assertEqual(confirmed.price, Decimal("5.00"))
 
     def test_update_line_remerges(self):
         a, _ = self.capture("a")
@@ -74,54 +65,43 @@ class CaptureTest(ScanTestCase):
         self.assertFalse(ScanLine.objects.filter(pk=b.pk).exists())
 
     def test_add_manual(self):
-        line = scan.add_manual(self.session, self.api, self.bolt, "IT", False)
+        line = scan.add_manual(self.session, self.bolt, "IT", False)
         self.assertEqual((line.condition, line.quantity, line.needs_confirmation), ("NM", 1, False))
 
 
-class ThresholdTest(ScanTestCase):
-    def test_threshold_and_override(self):
-        self.session.sale_threshold = Decimal("3.00")
-        self.session.save()
+class NoPriceTest(ScanTestCase):
+    def test_line_has_no_price_fields(self):
         line, _ = self.capture("a")
-        self.assertTrue(line.listed)
-        line.for_sale = False
-        self.assertFalse(line.listed)
-        line.for_sale, line.price = True, None
-        self.assertFalse(line.listed)
+        self.assertFalse(hasattr(line, "price") or hasattr(line, "for_sale") or hasattr(line, "listed"))
 
-    def test_threshold_remembered(self):
-        self.session.sale_threshold = Decimal("3.00")
-        self.session.save()
-        self.assertEqual(scan.start_session(self.user, None, "EX").sale_threshold, Decimal("3.00"))
-        self.assertIsNone(scan.start_session(self.other, None, "EX").sale_threshold)  # not another user's
+    def test_session_has_no_sale_threshold(self):
+        self.assertFalse(hasattr(self.session, "sale_threshold"))
 
 
 class SaveTest(ScanTestCase):
-    def setUp(self):
-        super().setUp()
-        self.session.sale_threshold = Decimal("3.00")
-        self.session.save()
-
     def printing(self, *, quantity=1, listing_status=None):
-        card = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="45", ct_blueprint_id=1201)
+        card = Card.objects.create(name="Counterspell", set_code="DMR", collector_number="45",
+                                   cm_product_id=cm_id(1201))
         item = CollectionItem.objects.create(owner=self.user, card=card, condition="NM", language="IT", quantity=quantity)
         if listing_status:
             Listing.objects.create(item=item, quantity=1, price=Decimal("9.00"), status=listing_status)
         return item
 
-    def test_save_creates_card_item_listing(self):
+    def test_save_only_adds_to_collection(self):
         Card.objects.filter(name="Counterspell").delete()
+        listings = Listing.objects.count()
         self.capture("a")
-        self.assertEqual(scan.save_session(self.session), (1, 1))
-        item = CollectionItem.objects.get(card__ct_blueprint_id=1201)
+        self.assertEqual(scan.save_session(self.session), 1)
+        item = CollectionItem.objects.get(card__cm_product_id=cm_id(1201))
         self.assertEqual((item.card.collector_number, item.quantity), ("45", 1))
-        self.assertEqual((item.listing.status, item.listing.price), (Listing.Status.TO_PUBLISH, Decimal("5.00")))
+        self.assertEqual(Listing.objects.count(), listings)
+        self.assertTrue(SyncLog.objects.filter(owner=self.user, message="Camera scan: 1 cards saved").exists())
 
     def test_save_adds_to_own_item_for_same_printing(self):
         mine = self.printing(quantity=2)
         friend_session = scan.start_session(self.other, self.dmr, "NM")
         rec = Recognition(name="Counterspell", language="IT")
-        scan.add_capture(friend_session, self.api, rec, Match(self.bolt, [self.bolt], "ok"), frame=b"jpeg", capture_id="f")
+        scan.add_capture(friend_session, rec, Match(self.bolt, [self.bolt], "ok"), frame=b"jpeg", capture_id="f")
         scan.save_session(friend_session)
         theirs = CollectionItem.objects.get(owner=self.other)
         self.assertEqual((theirs.card_id, theirs.quantity), (mine.card_id, 1))
@@ -139,45 +119,19 @@ class SaveTest(ScanTestCase):
 
     def test_save_upgrades_legacy_card_for_base_printing(self):
         legacy = Card.objects.get(name="Counterspell", set_code="DMR")  # demo: NM/IT x4 @0.80
-        line, _ = self.capture("a")
-        scan.update_line(line, for_sale=False)
+        self.capture("a")
         scan.save_session(self.session)
         legacy.refresh_from_db()
-        self.assertEqual((legacy.ct_blueprint_id, legacy.collector_number), (1201, "45"))
+        self.assertEqual((legacy.cm_product_id, legacy.collector_number), (cm_id(1201), "45"))
         self.assertEqual(legacy.items.get(condition="NM", language="IT").quantity, 5)
 
-    def test_save_adds_to_published_listing(self):
+    def test_save_leaves_existing_listing_alone(self):
         item = self.printing(listing_status=Listing.Status.PUBLISHED)
         self.capture("a")
-        self.capture("b")
         scan.save_session(self.session)
         item.listing.refresh_from_db()
-        self.assertEqual((item.listing.quantity, item.listing.status), (3, Listing.Status.TO_PUBLISH))
-
-    def test_save_restarts_sold_listing(self):
-        item = self.printing(listing_status=Listing.Status.SOLD)
-        self.capture("a")
-        scan.save_session(self.session)
-        item.listing.refresh_from_db()
-        self.assertEqual((item.listing.quantity, item.listing.status, item.listing.price),
-                         (1, Listing.Status.TO_PUBLISH, Decimal("5.00")))
-
-    def test_save_collection_only_leaves_listing(self):
-        item = self.printing(listing_status=Listing.Status.PUBLISHED)
-        line, _ = self.capture("a")
-        scan.update_line(line, for_sale=False)
-        scan.save_session(self.session)
-        item.listing.refresh_from_db()
-        self.assertEqual((item.listing.quantity, item.listing.status), (1, Listing.Status.PUBLISHED))
-
-    def test_save_without_price(self):
-        Card.objects.filter(name="Counterspell").delete()
-        self.price = None
-        line, _ = self.capture("a")
-        scan.update_line(line, for_sale=True)
-        self.assertEqual(scan.save_session(self.session), (1, 0))
-        item = CollectionItem.objects.get(card__ct_blueprint_id=1201)
-        self.assertFalse(Listing.objects.filter(item=item).exists())
+        item.refresh_from_db()
+        self.assertEqual((item.quantity, item.listing.quantity, item.listing.status), (2, 1, Listing.Status.PUBLISHED))
 
     def test_save_blocked_by_unconfirmed(self):
         self.capture("a", certain=False)
@@ -203,12 +157,12 @@ class CardForPrintingTest(ScanTestCase):  # I4
     def test_alternate_printings_without_number_stay_separate(self):
         Blueprint.objects.filter(pk=self.bolt.pk).update(collector_number="")
         base = Blueprint.objects.get(pk=self.bolt.pk)
-        alt = Blueprint.objects.create(ct_id=1299, expansion=self.dmr, name="Counterspell", version="borderless")
+        alt = Blueprint.objects.create(cm_product_id=cm_id(1299), expansion=self.dmr, name="Counterspell")
         self.save_blueprints(base, alt)
-        self.assertEqual(Card.objects.filter(ct_blueprint_id__in=[1201, 1299]).count(), 2)
+        self.assertEqual(Card.objects.filter(cm_product_id__in=[cm_id(1201), cm_id(1299)]).count(), 2)
 
     def test_printings_sharing_a_number_stay_separate(self):
-        alt = Blueprint.objects.create(ct_id=1299, expansion=self.dmr, name="Counterspell",
-                                       collector_number="45", version="borderless")
+        alt = Blueprint.objects.create(cm_product_id=cm_id(1299), expansion=self.dmr, name="Counterspell",
+                                       collector_number="45")
         self.save_blueprints(self.bolt, alt)
-        self.assertEqual(Card.objects.filter(ct_blueprint_id__in=[1201, 1299]).count(), 2)
+        self.assertEqual(Card.objects.filter(cm_product_id__in=[cm_id(1201), cm_id(1299)]).count(), 2)

@@ -88,7 +88,6 @@ def account(request):
             "last_sync": cardtrader.last_sync,
             "token_saved": bool(cardtrader.api_token),
         },
-        "shares_token": user.is_superuser and ledger_services.service_account_user() == user,
         "password_help": password_validation.password_validators_help_texts(),
     })
 

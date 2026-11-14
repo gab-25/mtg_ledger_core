@@ -1,9 +1,7 @@
-"""Local copy of the CardTrader catalog and printing lookup."""
+"""Local card catalog (Cardmarket products described by Scryfall) and printing lookup."""
 
 import re
-from urllib.parse import urljoin
-
-CARDTRADER_URL = "https://cardtrader.com"
+from dataclasses import dataclass
 
 _NUMBER = re.compile(r"^0*(\d+)(.*)$")
 
@@ -15,11 +13,6 @@ def normalize_number(value):
     if m:
         return (m.group(1) or "0") + m.group(2)
     return value
-
-
-def blueprint_number(bp):
-    """Collector number of a CardTrader blueprint (export payload), normalised."""
-    return normalize_number((bp.get("fixed_properties") or {}).get("collector_number", ""))
 
 
 def _live_listing(item):
@@ -77,61 +70,6 @@ def merge_cards(source, target):
     return True
 
 
-def category_pks(ct_ids):
-    """{CardTrader category id: Category pk} for ct_ids; unknown ids get a nameless row until sync_categories."""
-    from .models import Category
-
-    ct_ids = {i for i in ct_ids if i is not None}
-    Category.objects.bulk_create([Category(ct_id=i) for i in ct_ids], ignore_conflicts=True)
-    return dict(Category.objects.filter(ct_id__in=ct_ids).values_list("ct_id", "pk"))
-
-
-def _editable_properties(bp):
-    props = bp.get("editable_properties")
-    if props is None:
-        return None
-    return [p["name"] for p in props if isinstance(p, dict) and p.get("name")]
-
-
-def _image_variant(bp, size):
-    """Absolute URL of a size of the blueprint's image ("show", "preview"…), "" when the export has none."""
-    image = bp.get("image")
-    variant = image.get(size) if isinstance(image, dict) else None
-    path = variant.get("url") if isinstance(variant, dict) else None
-    return urljoin(CARDTRADER_URL, path) if path else ""
-
-
-def _blueprint_fields(bp, categories):
-    """Map a /blueprints/export entry to Blueprint fields; categories is category_pks() of the export."""
-    fixed = bp.get("fixed_properties") or {}
-    image = bp.get("image_url") or ((bp.get("image") or {}).get("url") if isinstance(bp.get("image"), dict) else "")
-    return {
-        "name": bp["name"],
-        "collector_number": blueprint_number(bp),
-        "version": bp.get("version") or "",
-        "rarity": fixed.get("mtg_rarity") or "",
-        "image_url": (image or "")[:500],
-        "image_large_url": _image_variant(bp, "show")[:500],
-        "cm_price_id": next(iter(bp.get("card_market_ids") or []), None),
-        "category_id": categories.get(bp.get("category_id")),
-        "editable_properties": _editable_properties(bp),
-    }
-
-
-def refresh_product_flags(ct_ids):
-    """Align Card.is_product with the catalog for the cards of these blueprints (their category may be new)."""
-    from django.db.models import Exists, OuterRef, Q
-
-    from .models import CARD_CATEGORY_IDS, Blueprint, Card
-
-    product = Blueprint.objects.filter(ct_id=OuterRef("ct_blueprint_id"), category__isnull=False).filter(
-        ~Q(category__ct_id__in=CARD_CATEGORY_IDS)
-    )
-    cards = Card.objects.filter(ct_blueprint_id__in=list(ct_ids)).annotate(product=Exists(product))
-    return (cards.filter(product=True, is_product=False).update(is_product=True)
-            + cards.filter(product=False, is_product=True).update(is_product=False))
-
-
 def _mark_product(card, bp):
     if card.is_product != bp.is_product:
         card.is_product = bp.is_product
@@ -144,83 +82,150 @@ def card_for_blueprint(bp):
     from .forms import get_or_create_card
     from .models import Card, SyncLog
 
-    card = Card.objects.filter(ct_blueprint_id=bp.ct_id).first()
+    card = Card.objects.filter(cm_product_id=bp.cm_product_id).order_by("pk").first()
     if card is not None:
         return _mark_product(card, bp)
     set_code = bp.expansion.code.upper()
-    if not bp.version and bp.collector_number:
-        # base printing: adopt a hand-entered (name + set) row instead of duplicating it
+    if bp.collector_number:
+        # adopt a hand-entered (name + set) row instead of duplicating it
         legacy = Card.objects.filter(
-            name__iexact=bp.name, set_code=set_code, collector_number="", ct_blueprint_id__isnull=True
+            name__iexact=bp.name, set_code=set_code, collector_number="", cm_product_id__isnull=True
         ).first()
         if legacy is not None and not Card.objects.filter(
             set_code=set_code, collector_number=bp.collector_number
         ).exists():
-            legacy.ct_blueprint_id = bp.ct_id
+            legacy.cm_product_id = bp.cm_product_id
             legacy.collector_number = bp.collector_number
-            legacy.save(update_fields=["ct_blueprint_id", "collector_number"])
+            legacy.save(update_fields=["cm_product_id", "collector_number"])
             return _mark_product(legacy, bp)
-    # One Card per printing: a missing number, or one already taken by another blueprint, gets a unique stand-in.
-    number = bp.collector_number or f"CT{bp.ct_id}"
+    # One Card per printing: a missing number, or one already taken by another product, gets a unique stand-in.
+    number = bp.collector_number or stand_in_number(bp.cm_product_id)
     taken = Card.objects.filter(set_code=set_code, collector_number=number).first()
-    if taken is not None and taken.ct_blueprint_id not in (None, bp.ct_id):
+    if taken is not None and taken.cm_product_id not in (None, bp.cm_product_id):
         SyncLog.objects.create(
             level=SyncLog.Level.WARNING,
-            message=f"{bp} shares #{number} with {taken}: stored as #CT{bp.ct_id}"[:300],
+            message=f"{bp} shares #{number} with {taken}: stored as #{stand_in_number(bp.cm_product_id)}"[:300],
         )
-        number = f"CT{bp.ct_id}"
+        number = stand_in_number(bp.cm_product_id)
     card = get_or_create_card(bp.name, set_code, number)
-    if card.ct_blueprint_id is None:
-        card.ct_blueprint_id = bp.ct_id
-        card.save(update_fields=["ct_blueprint_id"])
+    if card.cm_product_id is None:
+        card.cm_product_id = bp.cm_product_id
+        card.save(update_fields=["cm_product_id"])
     return _mark_product(card, bp)
 
 
-def sync_expansions(client):
-    """Upsert every MTG expansion from CardTrader. Returns how many there are."""
-    from .cardtrader import MTG_GAME_ID
-    from .models import Expansion
-
-    count = 0
-    for e in client.expansions():
-        if e.get("game_id") != MTG_GAME_ID or not e.get("code"):
-            continue
-        Expansion.objects.update_or_create(ct_id=e["id"], defaults={"code": e["code"].lower(), "name": e["name"]})
-        count += 1
-    return count
+def stand_in_number(cm_product_id):
+    """The collector number of a printing that has none (products): unique per Cardmarket product."""
+    return f"CM{cm_product_id}"
 
 
-def sync_categories(client):
-    """Upsert every MTG category from CardTrader. Returns how many there are."""
-    from .models import Category
-
-    count = 0
-    for c in client.categories() or []:
-        Category.objects.update_or_create(ct_id=c["id"], defaults={"name": c.get("name") or ""})
-        count += 1
-    return count
-
-
-def ensure_blueprints(client, expansion, *, force=False):
-    """Load an expansion's blueprints once (or again with force). Returns how many were stored."""
-    from django.utils import timezone
-
+def blueprint_of(card):
+    """The catalog printing of a Ledger card: by its Cardmarket product, else by set code + collector number."""
     from .models import Blueprint
 
-    if expansion.blueprints_synced_at and not force:
-        return 0
-    count = 0
-    exported = client.blueprints(expansion.ct_id)
-    categories = category_pks(bp.get("category_id") for bp in exported)
-    for bp in exported:
-        Blueprint.objects.update_or_create(
-            ct_id=bp["id"], defaults={"expansion": expansion, **_blueprint_fields(bp, categories)}
-        )
-        count += 1
-    refresh_product_flags(bp["id"] for bp in exported)
-    expansion.blueprints_synced_at = timezone.now()
-    expansion.save(update_fields=["blueprints_synced_at"])
-    return count
+    if card.cm_product_id:
+        bp = Blueprint.objects.select_related("expansion", "category").filter(cm_product_id=card.cm_product_id).first()
+        if bp is not None:
+            return bp
+    number = normalize_number(card.collector_number)
+    if not number:
+        return None
+    return (Blueprint.objects.select_related("expansion", "category")
+            .filter(expansion__code=card.set_code.lower(), collector_number=number).order_by("cm_product_id").first())
+
+
+@dataclass
+class ReconcileResult:
+    linked: int = 0
+    unlinked: int = 0
+    rewritten: int = 0
+    merged: int = 0
+    clashes: int = 0
+
+
+def _fold(source, target, result):
+    """Merge source into target (same printing). False, logging it to the owners, when live listings clash."""
+    from .models import SyncLog
+
+    clash = clashing_owners(source, target)
+    if clash or not merge_cards(source, target):
+        for owner_id in clash:  # about someone's listings: only they see it
+            SyncLog.objects.create(
+                owner_id=owner_id, level=SyncLog.Level.WARNING,
+                message=f"{source} and {target} are the same printing but both have live listings: "
+                        f"merge them by hand"[:300],
+            )
+        result.clashes += 1
+        return False
+    result.merged += 1
+    return True
+
+
+def _same_printing(a, b):
+    """Two cards on one Cardmarket product are the same printing unless both carry different real numbers."""
+    na, nb = normalize_number(a.collector_number), normalize_number(b.collector_number)
+    stand_in = ("CT", "CM")
+    return not na or not nb or na == nb or na.startswith(stand_in) or nb.startswith(stand_in)
+
+
+def reconcile_cards():
+    """Align the Ledger's cards with the catalog: link, fold duplicates, take the catalog's set code and number.
+
+    1. a card with no Cardmarket product is linked by set code + collector number;
+    2. cards on the same product fold into the oldest when they are the same printing; otherwise (different real
+       numbers, e.g. base and showcase that CardTrader tied to one Cardmarket product), or when live listings
+       clash, the newer one is unlinked;
+    3. a linked card takes its printing's set code, collector number (or CM stand-in) and product flag; when another
+       card already holds them, the two fold.
+    """
+    from django.db.models import Count
+
+    from .models import Blueprint, Card
+    from .services import link_blueprint
+
+    result = ReconcileResult()
+    for card in Card.objects.filter(cm_product_id__isnull=True).exclude(collector_number=""):
+        link_blueprint(card)
+
+    duplicated = (Card.objects.exclude(cm_product_id=None).values("cm_product_id").annotate(n=Count("pk"))
+                  .filter(n__gt=1).values_list("cm_product_id", flat=True))
+    for cm in list(duplicated):
+        target, *sources = Card.objects.filter(cm_product_id=cm).order_by("pk")
+        for source in sources:
+            if not _same_printing(source, target) or not _fold(source, target, result):
+                source.cm_product_id = None
+                source.save(update_fields=["cm_product_id"])
+
+    linked_ids = Card.objects.exclude(cm_product_id=None).values("cm_product_id")
+    printings = {bp.cm_product_id: bp for bp in
+                 Blueprint.objects.select_related("expansion", "category").filter(cm_product_id__in=linked_ids)}
+    for card in Card.objects.filter(cm_product_id__in=list(printings)).order_by("pk"):
+        bp = printings[card.cm_product_id]
+        if not bp.collector_number and not bp.is_product and card.collector_number:
+            # a single Scryfall gives no number for: the card's own set code and number are the better identity
+            if card.is_product:
+                card.is_product = False
+                card.save(update_fields=["is_product"])
+            continue
+        set_code, number = bp.expansion.code.upper(), bp.collector_number or stand_in_number(bp.cm_product_id)
+        if (card.set_code, card.collector_number, card.is_product) == (set_code, number, bp.is_product):
+            continue
+        taken = Card.objects.filter(set_code=set_code, collector_number=number).exclude(pk=card.pk).first()
+        if taken is not None and taken.cm_product_id not in (None, bp.cm_product_id):
+            number = stand_in_number(bp.cm_product_id)  # the number belongs to another printing
+            taken = Card.objects.filter(set_code=set_code, collector_number=number).exclude(pk=card.pk).first()
+        if taken is not None:
+            if _fold(card, taken, result):
+                taken.cm_product_id, taken.is_product = bp.cm_product_id, bp.is_product
+                taken.save(update_fields=["cm_product_id", "is_product"])
+            continue
+        card.set_code, card.collector_number, card.is_product = set_code, number, bp.is_product
+        card.save(update_fields=["set_code", "collector_number", "is_product"])
+        result.rewritten += 1
+
+    result.linked = Card.objects.filter(cm_product_id__in=Blueprint.objects.values("cm_product_id")).count()
+    result.unlinked = Card.objects.count() - result.linked
+    return result
 
 
 def expansion_by_code(code):

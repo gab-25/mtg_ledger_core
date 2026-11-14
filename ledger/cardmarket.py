@@ -1,18 +1,23 @@
-"""Cardmarket prices: the public daily price guide and the prices it gives to Ledger cards.
+"""Cardmarket's public files: the product lists the catalog is built from, and the daily price guide.
 
-Each CardTrader blueprint carries its Cardmarket product ids, which tie it to a row of the price guide. The guide is
-downloaded by the nightly catalog sync (ledger/catalog_sync.py).
+A catalog blueprint is a Cardmarket product, so its id is the row of the price guide. Both are downloaded by the
+nightly catalog sync (ledger/catalog_sync.py).
 """
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
 import httpx
 
-from .catalog import normalize_number
+from .catalog import blueprint_of, normalize_number
 from .models import Blueprint, Card, CardmarketPrice
 
 PRICE_GUIDE_URL = "https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_1.json"
+PRODUCT_LIST_URLS = (
+    "https://downloads.s3.cardmarket.com/productCatalog/productList/products_singles_1.json",
+    "https://downloads.s3.cardmarket.com/productCatalog/productList/products_nonsingles_1.json",
+)
 USER_AGENT = "mtg-ledger/0.1"
 
 # Price guide key -> CardmarketPrice field
@@ -27,6 +32,17 @@ class CardmarketError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class CmProduct:
+    """A row of Cardmarket's product lists: a single card, a sealed product or an accessory."""
+
+    id_product: int
+    name: str
+    id_category: int
+    category_name: str
+    id_expansion: int
+
+
 def make_client(transport=None):
     return httpx.Client(
         headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -37,23 +53,16 @@ def make_client(transport=None):
 # --- lookups ---------------------------------------------------------------
 
 def blueprint_for(card):
-    """The CardTrader printing of a Ledger card: its matched blueprint, else set code + collector number."""
-    if card.ct_blueprint_id:
-        bp = Blueprint.objects.filter(ct_id=card.ct_blueprint_id).first()
-        if bp is not None:
-            return bp
-    number = normalize_number(card.collector_number)
-    if not number:
-        return None
-    return Blueprint.objects.filter(expansion__code=card.set_code.lower(), collector_number=number).first()
+    """The catalog printing of a Ledger card (catalog.blueprint_of)."""
+    return blueprint_of(card)
 
 
 def suggested_price(card, foil):
     """Cardmarket trend to suggest when listing a copy of card (foil trend for foil copies), or None."""
     bp = blueprint_for(card)
-    if bp is None or bp.cm_price_id is None:
+    if bp is None:
         return None
-    price = CardmarketPrice.objects.filter(pk=bp.cm_price_id).first()
+    price = CardmarketPrice.objects.filter(pk=bp.cm_product_id).first()
     if price is None:
         return None
     trend = price.trend_foil if foil and not card.is_product else price.trend
@@ -61,26 +70,27 @@ def suggested_price(card, foil):
 
 
 def owned_quantities(owner):
-    """{blueprint ct_id: copies in owner's collection}, matching cards like blueprint_for()."""
+    """{Cardmarket product id: copies in owner's collection}, matching cards like blueprint_for()."""
     from django.db.models import Q, Sum
 
     per_card = list(
         Card.objects.annotate(qty=Sum("items__quantity", filter=Q(items__owner=owner))).filter(qty__gt=0)
-        .values_list("ct_blueprint_id", "set_code", "collector_number", "qty")
+        .values_list("cm_product_id", "set_code", "collector_number", "qty")
     )
-    known = set(Blueprint.objects.filter(ct_id__in=[c[0] for c in per_card if c[0]]).values_list("ct_id", flat=True))
-    wanted = {(s.lower(), normalize_number(n)) for bp, s, n, _ in per_card if bp not in known and normalize_number(n)}
+    known = set(Blueprint.objects.filter(cm_product_id__in=[c[0] for c in per_card if c[0]])
+                .values_list("cm_product_id", flat=True))
+    wanted = {(s.lower(), normalize_number(n)) for cm, s, n, _ in per_card if cm not in known and normalize_number(n)}
     by_printing = {}
     if wanted:
         rows = Blueprint.objects.filter(
             expansion__code__in={s for s, _ in wanted}, collector_number__in={n for _, n in wanted}
-        ).order_by("-ct_id").values_list("expansion__code", "collector_number", "ct_id")
-        by_printing = {(s, n): ct_id for s, n, ct_id in rows}
+        ).order_by("-cm_product_id").values_list("expansion__code", "collector_number", "cm_product_id")
+        by_printing = {(s, n): cm for s, n, cm in rows}
     owned = {}
-    for bp, s, n, qty in per_card:
-        ct_id = bp if bp in known else by_printing.get((s.lower(), normalize_number(n)))
-        if ct_id is not None:
-            owned[ct_id] = owned.get(ct_id, 0) + qty
+    for cm, s, n, qty in per_card:
+        cm_id = cm if cm in known else by_printing.get((s.lower(), normalize_number(n)))
+        if cm_id is not None:
+            owned[cm_id] = owned.get(cm_id, 0) + qty
     return owned
 
 
@@ -106,6 +116,24 @@ def fetch_guide(client):
     except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
         raise CardmarketError(f"Cardmarket price guide: {type(exc).__name__}: {exc}") from exc
     return prices, guide_date
+
+
+def fetch_products(client):
+    """[CmProduct] of every MTG single and non-single in Cardmarket's public product lists."""
+    products = []
+    try:
+        for url in PRODUCT_LIST_URLS:
+            response = client.get(url)
+            response.raise_for_status()
+            for p in response.json()["products"]:
+                products.append(CmProduct(
+                    int(p["idProduct"]), p["name"], int(p["idCategory"]), p.get("categoryName") or "",
+                    int(p["idExpansion"]),
+                ))
+            del response
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise CardmarketError(f"Cardmarket products: {type(exc).__name__}: {exc}") from exc
+    return products
 
 
 def price_row(id_product, values, guide_date):

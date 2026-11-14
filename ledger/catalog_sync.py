@@ -1,24 +1,25 @@
-"""Nightly catalog sync: the card database from CardTrader and the prices from Cardmarket.
+"""Nightly catalog sync: the card database from Cardmarket's and Scryfall's public files, no token needed.
 
-CardTrader is the master card database: every MTG expansion and every blueprint (printing) is reloaded from its
-API, then tied to Cardmarket's public daily price guide (ledger/cardmarket.py). The outcome goes to the SyncLog.
+Cardmarket's product lists give every MTG product (singles, sealed, accessories) and its category; Scryfall gives the
+set, collector number, rarity and images of the singles, tied by their Cardmarket id; Cardmarket's price guide gives
+the prices. Then the Ledger's cards are aligned with the catalog (catalog.reconcile_cards). Outcome in the SyncLog.
 """
 
 import logging
-import time
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from itertools import batched
 
-from . import cardmarket, services
+from . import cardmarket, catalog, scryfall
 from .cardmarket import PRICE_FIELDS, CardmarketError
-from .cardtrader import MTG_GAME_ID, CardTraderError
-from .catalog import _blueprint_fields, category_pks, normalize_number, refresh_product_flags
-from .models import Blueprint, Card, CardmarketPrice, Category, Expansion, SyncLog
+from .models import CARD_CATEGORY_ID, Blueprint, CardmarketPrice, Category, Expansion, SyncLog
+from .scryfall import ScryfallError
 
 BATCH = 2000
-BLUEPRINT_PAUSE = 0.06  # CardTrader allows 200 requests per 10 s across all endpoints
-RATE_LIMIT_WAIT = 10
+# Blueprints missing from the files are removed only when the download holds at least this share of the catalog:
+# a truncated or emptied file must not wipe it.
+PRUNE_MIN_SHARE = 0.5
 
 logger = logging.getLogger(__name__)
 
@@ -32,160 +33,148 @@ class SyncResult:
     expansions: int
     blueprints: int
     priced: int
-    linked: int
-    unlinked: int
+    skipped: int
+    pruned: int
+    reconciled: catalog.ReconcileResult
     guide_date: datetime
-    failed: list = field(default_factory=list)
 
 
-# --- download ----------------------------------------------------------------
-
-def _export(client, expansion_id):
-    try:
-        return client.blueprints(expansion_id) or []
-    except CardTraderError as exc:
-        if exc.status != 429:
-            raise
-        time.sleep(RATE_LIMIT_WAIT)
-        return client.blueprints(expansion_id) or []
+def _main_sets(products, cards):
+    """{Cardmarket expansion id: the Scryfall set most of its singles belong to} (ties: the shortest code)."""
+    counts = defaultdict(Counter)
+    for p in products:
+        card = cards.get(p.id_product)
+        if p.id_category == CARD_CATEGORY_ID and card is not None:
+            counts[p.id_expansion][card.set_code] += 1
+    return {exp: min(c.items(), key=lambda kv: (-kv[1], len(kv[0]), kv[0]))[0] for exp, c in counts.items()}
 
 
-class _RawCategory(dict):
-    """A categories mapping for _blueprint_fields() that keeps CardTrader's own category id."""
+def _rows(products, cards):
+    """([(cm id, name, set code, number, rarity, image, large image, Cardmarket category)], skipped products).
 
-    def get(self, key, default=None):
-        return key
-
-
-def _compact(blueprints):
-    """{blueprint ct_id: Blueprint fields} of an export; category_id is still CardTrader's category id.
-
-    Only these fields are kept: the whole export of every expansion, as parsed JSON, does not fit in the worker.
+    A product without a Scryfall card (sealed, accessories, unmatched singles) goes to the main set of its Cardmarket
+    expansion, without a number; when that expansion has no matched single, it is skipped.
     """
-    try:
-        return {bp["id"]: _blueprint_fields(bp, _RawCategory()) for bp in blueprints}
-    except (KeyError, TypeError, AttributeError) as exc:
-        raise CatalogSyncError(f"CardTrader blueprints: {type(exc).__name__}: {exc}") from exc
+    main = _main_sets(products, cards)
+    rows, skipped = [], 0
+    for p in products:
+        card = cards.get(p.id_product)
+        if card is not None:
+            rows.append((p.id_product, p.name, card.set_code, card.collector_number, card.rarity, card.image_url,
+                         card.image_large_url, p.id_category))
+            continue
+        code = main.get(p.id_expansion)
+        if code is None:
+            skipped += 1
+            continue
+        rows.append((p.id_product, p.name, code, "", "", "", "", p.id_category))
+    return rows, skipped
 
 
-def _fetch_catalog(client):
-    """(MTG expansions, {blueprint ct_id: (expansion ct_id, fields)}, ct_ids of the expansions loaded,
-    codes of expansions that could not be loaded)."""
-    try:
-        expansions = [e for e in client.expansions() if e.get("game_id") == MTG_GAME_ID and e.get("code")]
-    except CardTraderError as exc:
-        raise CatalogSyncError(f"CardTrader expansions: {exc}") from exc
-    blueprints, loaded, failed = {}, [], []
-    for e in expansions:
-        try:
-            exported = _export(client, e["id"])
-        except CardTraderError as exc:
-            logger.warning("Blueprints of %s not loaded: %s", e["code"], exc)
-            failed.append(e["code"].lower())
-        else:
-            blueprints.update((ct_id, (e["id"], fields)) for ct_id, fields in _compact(exported).items())
-            loaded.append(e["id"])
-        time.sleep(BLUEPRINT_PAUSE)
-    return expansions, blueprints, loaded, sorted(failed)
+def _prune(written):
+    """Remove the blueprints the files no longer hold (not those an open scan line uses). Returns how many went."""
+    from .models import ScanLine, ScanSession
+
+    stale = Blueprint.objects.exclude(cm_product_id__in=written)
+    in_use = ScanLine.objects.filter(session__status=ScanSession.Status.OPEN).exclude(blueprint=None)
+    stale = stale.exclude(pk__in=in_use.values("blueprint_id"))
+    ScanLine.objects.filter(blueprint__in=stale).update(blueprint=None)  # saved sessions keep their history
+    return stale.delete()[1].get("ledger.Blueprint", 0)
 
 
-# --- write -------------------------------------------------------------------
+def _write(rows, categories, sets, prices, guide_date):
+    """Write the catalog and the prices in one transaction; stale blueprints, empty expansions and categories go.
 
-def _count_links():
-    """(linked, unlinked) Ledger cards against the local catalog."""
-    ids = set(Blueprint.objects.values_list("ct_id", flat=True))
-    printings = set(Blueprint.objects.values_list("expansion__code", "collector_number"))
-    linked = unlinked = 0
-    for card in Card.objects.only("set_code", "collector_number", "ct_blueprint_id"):
-        number = normalize_number(card.collector_number)
-        if card.ct_blueprint_id in ids or (number and (card.set_code.lower(), number) in printings):
-            linked += 1
-        else:
-            unlinked += 1
-    return linked, unlinked
-
-
-def sync(cm_client, ct_client):
-    """Reload the card database from CardTrader and the prices from Cardmarket.
-
-    Everything is downloaded before anything is written; an expansion whose blueprints fail keeps what it had.
+    Returns how many blueprints were pruned.
     """
     from django.db import transaction
-    from django.utils import timezone
 
+    codes = {r[2] for r in rows}
+    pruned = 0
+    with transaction.atomic():
+        prune = len(rows) >= PRUNE_MIN_SHARE * Blueprint.objects.count()
+        Expansion.objects.bulk_create(
+            [Expansion(code=code, name=sets[code].name if code in sets else code.upper(),
+                       released_at=sets[code].released_at if code in sets else None) for code in sorted(codes)],
+            update_conflicts=True, unique_fields=["code"], update_fields=["name", "released_at"],
+        )
+        Category.objects.bulk_create(
+            [Category(cm_id=i, name=name) for i, name in categories.items()],
+            update_conflicts=True, unique_fields=["cm_id"], update_fields=["name"],
+        )
+        expansion_pk = dict(Expansion.objects.filter(code__in=codes).values_list("code", "pk"))
+        category_pk = dict(Category.objects.values_list("cm_id", "pk"))
+        # Models are built and written one batch at a time: all of them at once do not fit in the worker.
+        for chunk in batched(rows, BATCH):
+            Blueprint.objects.bulk_create(
+                [
+                    Blueprint(cm_product_id=cm, name=name[:200], expansion_id=expansion_pk[code],
+                              collector_number=number[:40], rarity=rarity[:40], image_url=small,
+                              image_large_url=large, category_id=category_pk[category])
+                    for cm, name, code, number, rarity, small, large, category in chunk
+                ],
+                update_conflicts=True, unique_fields=["cm_product"],
+                update_fields=["expansion", "name", "collector_number", "rarity", "image_url", "image_large_url",
+                               "category"],
+            )
+        for chunk in batched(prices.items(), BATCH):
+            CardmarketPrice.objects.bulk_create(
+                [cardmarket.price_row(id_product, values, guide_date) for id_product, values in chunk],
+                update_conflicts=True, unique_fields=["id_product"],
+                update_fields=[*PRICE_FIELDS.values(), "prices_date"],
+            )
+        if prune:
+            pruned = _prune([r[0] for r in rows])
+        else:
+            logger.warning("Catalog sync: %s printings downloaded, too few to prune the catalog", len(rows))
+        Category.objects.filter(blueprints__isnull=True).delete()
+        Expansion.objects.filter(blueprints__isnull=True).delete()
+    return pruned
+
+
+def sync(cm_client, sf_client):
+    """Rebuild the catalog from the public files, then align the Ledger's cards with it.
+
+    Everything is downloaded before anything is written.
+    """
     prices, guide_date = cardmarket.fetch_guide(cm_client)
-    expansions, blueprints, loaded, failed = _fetch_catalog(ct_client)
-    try:
-        categories = ct_client.categories() or []
-    except CardTraderError as exc:
-        raise CatalogSyncError(f"CardTrader categories: {exc}") from exc
-    now = timezone.now()
-    try:
-        expansion_objs = [Expansion(ct_id=e["id"], code=e["code"].lower(), name=e["name"]) for e in expansions]
-        with transaction.atomic():
-            Expansion.objects.bulk_create(
-                expansion_objs, update_conflicts=True, unique_fields=["ct_id"], update_fields=["code", "name"],
-            )
-            Category.objects.bulk_create(
-                [Category(ct_id=c["id"], name=c.get("name") or "") for c in categories],
-                update_conflicts=True, unique_fields=["ct_id"], update_fields=["name"],
-            )
-            pk_by_ct = dict(Expansion.objects.values_list("ct_id", "pk"))
-            category_by_ct = category_pks(fields["category_id"] for _, fields in blueprints.values())
-            # Models are built and written one batch at a time: all of them at once do not fit in the worker.
-            for chunk in batched(blueprints.items(), BATCH):
-                Blueprint.objects.bulk_create(
-                    [
-                        Blueprint(
-                            ct_id=ct_id, expansion_id=pk_by_ct[exp_ct_id],
-                            **{**fields, "category_id": category_by_ct.get(fields["category_id"])},
-                        )
-                        for ct_id, (exp_ct_id, fields) in chunk
-                    ],
-                    update_conflicts=True, unique_fields=["ct_id"],
-                    update_fields=[
-                        "expansion", "name", "collector_number", "version", "rarity", "image_url", "image_large_url",
-                        "cm_price", "category", "editable_properties",
-                    ],
-                )
-            refresh_product_flags(blueprints.keys())
-            Expansion.objects.filter(ct_id__in=loaded).update(blueprints_synced_at=now)
-            for chunk in batched(prices.items(), BATCH):
-                CardmarketPrice.objects.bulk_create(
-                    [cardmarket.price_row(id_product, values, guide_date) for id_product, values in chunk],
-                    update_conflicts=True, unique_fields=["id_product"],
-                    update_fields=[*PRICE_FIELDS.values(), "prices_date"],
-                )
-    except (KeyError, TypeError) as exc:  # unexpected CardTrader shape, raised before the transaction commits
-        raise CatalogSyncError(f"CardTrader blueprints: {type(exc).__name__}: {exc}") from exc
-    linked, unlinked = _count_links()
-    priced = sum(1 for _, fields in blueprints.values() if fields["cm_price_id"] in prices)
+    products = cardmarket.fetch_products(cm_client)
+    sets = scryfall.fetch_sets(sf_client)
+    cards = scryfall.fetch_cards(sf_client)
+    rows, skipped = _rows(products, cards)
+    del cards
+    categories = {p.id_category: p.category_name for p in products}
+    del products
+    pruned = _write(rows, categories, sets, prices, guide_date)
     return SyncResult(
-        expansions=len(expansions), blueprints=len(blueprints), priced=priced, linked=linked, unlinked=unlinked,
-        guide_date=guide_date, failed=failed,
+        expansions=len({r[2] for r in rows}), blueprints=len(rows), priced=sum(1 for r in rows if r[0] in prices),
+        skipped=skipped, pruned=pruned, reconciled=catalog.reconcile_cards(), guide_date=guide_date,
     )
 
 
 def _summary(result):
+    r = result.reconciled
     message = (
         f"Catalog sync: {result.expansions} expansions, {result.blueprints} printings, {result.priced} priced "
-        f"(guide {result.guide_date:%Y-%m-%d}), {result.linked} cards linked, {result.unlinked} not linked"
+        f"(guide {result.guide_date:%Y-%m-%d}), {r.linked} cards linked, {r.unlinked} not linked"
     )
-    if result.failed:
-        shown = ", ".join(result.failed[:10]) + (", …" if len(result.failed) > 10 else "")
-        message += f"; {len(result.failed)} expansions not loaded ({shown})"
+    if result.skipped:
+        message += f", {result.skipped} products without set"
+    if result.pruned:
+        message += f", {result.pruned} printings removed"
+    if r.clashes:
+        message += f", {r.clashes} duplicates to merge by hand"
     return message
 
 
-def run_sync(cm_client=None):
+def run_sync(cm_client=None, sf_client=None):
     """sync() with its outcome written to the SyncLog. Returns the result, or None when it could not run."""
-    own_cm = cm_client is None
+    own_cm, own_sf = cm_client is None, sf_client is None
     cm_client = cm_client or cardmarket.make_client()
-    ct_client = None
+    sf_client = sf_client or scryfall.make_client()
     try:
-        ct_client = services.service_client()
-        result = sync(cm_client, ct_client)
-    except (CatalogSyncError, CardmarketError, CardTraderError) as exc:
+        result = sync(cm_client, sf_client)
+    except (CatalogSyncError, CardmarketError, ScryfallError) as exc:
         SyncLog.objects.create(message=f"Catalog sync failed: {exc}"[:300], level=SyncLog.Level.WARNING)
         return None
     except Exception as exc:
@@ -196,10 +185,10 @@ def run_sync(cm_client=None):
         )
         raise
     finally:
-        if ct_client is not None:
-            ct_client.close()
         if own_cm:
             cm_client.close()
-    level = SyncLog.Level.WARNING if result.failed else SyncLog.Level.OK
+        if own_sf:
+            sf_client.close()
+    level = SyncLog.Level.WARNING if result.reconciled.clashes else SyncLog.Level.OK
     SyncLog.objects.create(message=_summary(result)[:300], level=level)
     return result

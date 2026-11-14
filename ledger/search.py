@@ -8,10 +8,10 @@ from operator import add
 
 from django.contrib.postgres.search import TrigramSimilarity, TrigramWordSimilarity
 from django.db import connection
-from django.db.models import Case, CharField, Func, IntegerField, Q, Value, When
+from django.db.models import Case, CharField, F, Func, IntegerField, Q, Value, When
 
 from .catalog import normalize_number
-from .models import CARD_CATEGORY_IDS, Expansion
+from .models import CARD_CATEGORY_ID, Expansion
 
 _NUMBER = re.compile(r"\d+[a-z]?")
 # Minimum pg_trgm word similarity of every query word to the name in the typo-tolerant fallback, run only when no
@@ -83,10 +83,10 @@ def _term_condition(query, ids, words):
 def _tie_breaks():
     """Cards (and blueprints not yet categorised) before sealed products, then newest expansion first."""
     is_product = Case(
-        When(Q(category__isnull=True) | Q(category__ct_id__in=CARD_CATEGORY_IDS), then=Value(0)),
+        When(Q(category__isnull=True) | Q(category__cm_id=CARD_CATEGORY_ID), then=Value(0)),
         default=Value(1), output_field=IntegerField(),
     )
-    return [is_product, "-expansion__ct_id", "name", "ct_id"]
+    return [is_product, F("expansion__released_at").desc(nulls_last=True), "name", "cm_product_id"]
 
 
 def search_blueprints(queryset, q):

@@ -29,8 +29,8 @@ uv run python manage.py makemigrations --check --dry-run
 uv run python manage.py spectacular --validate --fail-on-warn --file /dev/null   # OpenAPI schema check
 
 docker compose up -d redis && uv run celery -A config worker --loglevel=info     # catalog sync worker
-uv run python manage.py sync_catalog             # queue the nightly catalog + price sync
-uv run python manage.py sync_catalog --set CODE  # reload one expansion now (no worker)
+uv run python manage.py sync_catalog             # queue the nightly catalog + price sync (run it right after
+                                                 # the first migrate: the catalog starts empty)
 ```
 
 There is no linter or formatter configured. Settings come only from the environment / `.env` (see `.env.example`);
@@ -48,18 +48,26 @@ There is no linter or formatter configured. Settings come only from the environm
   (`ledger/test_ownership.py`). `SyncLog.objects.visible_to(user)` adds the global entries. The card catalog
   (`Expansion`, `Blueprint`) and prices are shared.
 - **CardTrader tokens**: each user has their own token on a `SyncService` row (`services.get_cardtrader(user)`);
-  `services.user_client(user)` never falls back to another user's token. The *service* token (catalog, prices,
-  scan recognition) is the first superuser's own token (`services.service_client()`). All clients are built by
-  `services.make_client`, which tests patch.
+  `services.user_client(user)` never falls back to another user's token, and nothing uses a shared or admin token:
+  CardTrader is only reached to sell (publish, orders, shipments). All clients are built by `services.make_client`,
+  which tests patch.
 - **Cards vs printings**: `Card` is the Ledger's own row (name + set + collector number) that `CollectionItem`
-  points to; `Blueprint` is a product in the local copy of the CardTrader catalog (`ledger/catalog.py`, loaded lazily
-  or nightly by `ledger/catalog_sync.py`, which also ties blueprints to the Cardmarket prices of
-  `ledger/cardmarket.py`). The catalog holds every CardTrader MTG product: `Blueprint.category` (CardTrader category) tells cards (ids 1-3) from sealed products and
-  accessories (`is_product`), and `editable_properties` lists what CardTrader takes when selling it. Collection items
-  are added only from the catalog (`catalog.card_for_blueprint`); products are stored Near Mint, non-foil, and never
-  send foil (nor a language CardTrader does not take). `ledger/pricing.py` caches CardTrader market prices.
+  points to, tied to its printing by `Card.cm_product_id`; `Blueprint` is a product of the local catalog, keyed by
+  its Cardmarket product id (`cm_product`, also the row of its Cardmarket price). The catalog is rebuilt only by the
+  nightly `ledger/catalog_sync.py`, from public files and no token: Cardmarket's product lists and price guide
+  (`ledger/cardmarket.py`) and Scryfall's Default Cards and sets (`ledger/scryfall.py`) for set code, collector
+  number, rarity and images. `Expansion` is a Scryfall set (each printing gets its own Scryfall set, so tokens and
+  promos have theirs); products without a Scryfall card go to the main set of their Cardmarket expansion, with no
+  number (cards get a `CM<id>` stand-in). `Blueprint.category` (Cardmarket category) tells cards (id 1) from sealed
+  products and accessories (`is_product`). After each sync `catalog.reconcile_cards` links, folds and rewrites cards
+  to the catalog's set code and number. Collection items are added only from the catalog
+  (`catalog.card_for_blueprint`); products are stored Near Mint, non-foil. When publishing,
+  `services.resolve_blueprints` finds the CardTrader blueprint with the seller's token (CardTrader's `card_market_ids`, then
+  number, then name) and what CardTrader takes for a product (its language is sent only if taken). The catalog and
+  collection JSON keep the old field names (`ct_id`, `category_id`), now holding Cardmarket ids.
 - **Scan pipeline**: photo → `ledger/openrouter.py` (vision model reads the card) → `ledger/recognition.py` (matches
-  it to a `Blueprint`) → `ledger/scan.py` (draft lines of a `ScanSession`, saved into the collection at the end).
+  it to a `Blueprint` of the local catalog) → `ledger/scan.py` (draft lines of a `ScanSession`, saved into the
+  collection at the end; no prices, nothing is put on sale).
   The scan API (`ledger/api/scan.py`) is the only one with real DRF serializers (`ledger/api/serializers.py`).
 - **API conventions** (`ledger/api/common.py`, `ledger/api/errors.py`): session auth + CSRF (`X-CSRFToken` from the
   `csrftoken` cookie); validation goes through Django forms and `form_errors(form)` turns them into DRF 400s;

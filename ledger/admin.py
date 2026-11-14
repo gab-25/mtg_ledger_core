@@ -63,19 +63,19 @@ class OrderAdmin(admin.ModelAdmin):
 
 @admin.register(Expansion)
 class ExpansionAdmin(admin.ModelAdmin):
-    list_display = ["code", "name", "ct_id", "blueprints_synced_at"]
+    list_display = ["code", "name", "released_at"]
     search_fields = ["code", "name"]
 
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
-    list_display = ["name", "ct_id"]
+    list_display = ["name", "cm_id"]
     search_fields = ["name"]
 
 
 @admin.register(Blueprint)
 class BlueprintAdmin(admin.ModelAdmin):
-    list_display = ["name", "expansion", "category", "collector_number", "version", "rarity", "ct_id"]
+    list_display = ["name", "expansion", "category", "collector_number", "rarity", "cm_product_id"]
     list_filter = ["category"]
     search_fields = ["name", "expansion__code"]
     list_select_related = ["expansion", "category"]

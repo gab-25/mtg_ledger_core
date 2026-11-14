@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass, field
 
-from django.core.cache import cache
 from django.db.models import Q
 
 from . import catalog
@@ -31,34 +30,19 @@ class Match:
     reason: str = "not_found"
 
 
-EXPANSIONS_SYNC_KEY = "ledger:expansions-synced"
-EXPANSIONS_SYNC_EVERY = 3600  # seconds: unknown set codes refresh the expansion list at most this often
-
-
-def _expansion_for_code(client, code):
-    found = catalog.expansion_by_code(code)
-    if found is None and cache.add(EXPANSIONS_SYNC_KEY, True, EXPANSIONS_SYNC_EVERY):
-        catalog.sync_expansions(client)
-        found = catalog.expansion_by_code(code)
-    return found
-
-
-def _scope(client, rec, expansion):
+def _scope(rec, expansion):
     """(blueprints to search, certain_allowed). Matches outside a known expansion are never certain."""
     code = rec.set_code.strip().lower()
     if expansion is not None and (not code or code == expansion.code):
-        catalog.ensure_blueprints(client, expansion)
         return Blueprint.objects.filter(expansion=expansion), True
     if code:
         # A printed code wins over the locked expansion: boosters hold bonus-sheet and List cards.
-        found = _expansion_for_code(client, code)
+        found = catalog.expansion_by_code(code)
         if found is not None:
-            catalog.ensure_blueprints(client, found)
             return Blueprint.objects.filter(expansion=found), True
     if expansion is not None:
-        catalog.ensure_blueprints(client, expansion)
         return Blueprint.objects.filter(expansion=expansion), False
-    # No usable set code: search what is already in the local catalog, and let the owner confirm.
+    # No usable set code: search the whole local catalog, and let the owner confirm.
     return Blueprint.objects.all(), False
 
 
@@ -77,7 +61,7 @@ def same_name(bp, name):
 
 def _candidates(scope, name, hits=()):
     """Cards with the name read first (number hits, then the scope, then anywhere if the scope has none),
-    then number hits with another name. Within each group: base version first, then by ct_id."""
+    then number hits with another name. Within each group: by Cardmarket product id."""
     named = list(_by_name(Blueprint.objects.all(), name).select_related("expansion"))
     in_scope = set(scope.filter(pk__in=[b.pk for b in named]).values_list("pk", flat=True))
     if in_scope:
@@ -87,14 +71,14 @@ def _candidates(scope, name, hits=()):
 
     def rank(bp):
         place = 0 if bp.pk in hit_ids else 1 if bp.pk in in_scope else 2
-        return (place if bp.pk in named_ids else 3, bp.version != "", bp.ct_id)
+        return (place if bp.pk in named_ids else 3, bp.cm_product_id)
 
     others = [h for h in hits if h.pk not in named_ids]
     return sorted(named + others, key=rank)[:MAX_CANDIDATES]
 
 
-def match(client, rec, expansion):
-    scope, certain_allowed = _scope(client, rec, expansion)
+def match(rec, expansion):
+    scope, certain_allowed = _scope(rec, expansion)
     number = catalog.normalize_number(rec.collector_number)
     certain = None
 
