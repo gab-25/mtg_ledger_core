@@ -4,24 +4,16 @@ from django.db import IntegrityError, transaction
 from django.db.models import Max, Q
 from django.db.models.functions import Greatest
 
-from . import catalog, pricing
-from .cardtrader import CardTraderError
-from .models import CollectionItem, Listing, ScanCapture, ScanLine, ScanSession, SyncLog
-
-UNSET = object()
-
+from . import catalog
+from .models import CollectionItem, ScanCapture, ScanLine, ScanSession, SyncLog
 
 class ScanError(Exception):
     pass
 
 
 def start_session(owner, expansion, condition):
-    """New session for owner; the sale threshold is remembered from their latest session."""
-    last = ScanSession.objects.owned_by(owner).order_by("-created_at", "-id").first()
-    return ScanSession.objects.create(
-        owner=owner, expansion=expansion, default_condition=condition,
-        sale_threshold=last.sale_threshold if last else None,
-    )
+    """New session for owner."""
+    return ScanSession.objects.create(owner=owner, expansion=expansion, default_condition=condition)
 
 
 def open_sessions(owner):
@@ -32,20 +24,6 @@ def open_sessions(owner):
     return (ScanSession.objects.owned_by(owner).filter(status=ScanSession.Status.OPEN)
             .annotate(last_activity=Greatest("updated_at", Max("lines__updated_at")))
             .select_related("expansion").order_by("-last_activity", "-id"))
-
-
-def _price(client, line):
-    if line.blueprint is None or not line.language:
-        return None
-    if client is None:
-        from . import services
-
-        try:
-            with services.service_client() as own:
-                return pricing.price_for(own, line.blueprint.ct_id, line.language, line.foil, line.condition)
-        except CardTraderError:
-            return None
-    return pricing.price_for(client, line.blueprint.ct_id, line.language, line.foil, line.condition)
 
 
 def _twin(line):
@@ -74,7 +52,7 @@ def _merge_or_save(line):
     return twin
 
 
-def _add_certain(session, client, blueprint, language, foil):
+def _add_certain(session, blueprint, language, foil):
     line = ScanLine(
         session=session, blueprint=blueprint, language=language, foil=foil, condition=session.default_condition,
     )
@@ -83,7 +61,6 @@ def _add_certain(session, client, blueprint, language, foil):
         twin.quantity += 1
         twin.save(update_fields=["quantity", "updated_at"])
         return twin, True
-    line.price = _price(client, line)
     line.save()
     return line, False
 
@@ -103,14 +80,14 @@ def release_capture(capture):
         capture.delete()
 
 
-def add_capture(session, client, rec, m, *, frame, capture_id="", capture=None):
+def add_capture(session, rec, m, *, frame, capture_id="", capture=None):
     """Add what one camera capture recognised. Returns (line, merged); a repeated capture id changes nothing."""
     if capture is None and capture_id:
         capture, created = reserve_capture(session, capture_id)
         if not created:
             return capture.line, False
     if m.blueprint is not None:
-        line, merged = _add_certain(session, client, m.blueprint, rec.language, rec.foil)
+        line, merged = _add_certain(session, m.blueprint, rec.language, rec.foil)
     else:
         line = ScanLine.objects.create(
             session=session, language=rec.language, foil=rec.foil, condition=session.default_condition,
@@ -124,9 +101,9 @@ def add_capture(session, client, rec, m, *, frame, capture_id="", capture=None):
     return line, merged
 
 
-def add_manual(session, client, blueprint, language, foil):
+def add_manual(session, blueprint, language, foil):
     """The Search button: add one copy of a printing picked by hand."""
-    line, _ = _add_certain(session, client, blueprint, language, foil)
+    line, _ = _add_certain(session, blueprint, language, foil)
     return line
 
 
@@ -138,7 +115,7 @@ def undo(line):
         line.delete()
 
 
-def update_line(line, *, client=None, foil=None, condition=None, language=None, quantity=None, for_sale=UNSET):
+def update_line(line, *, foil=None, condition=None, language=None, quantity=None):
     """Edit a draft line from the toast or the review screen. Returns the surviving line (None if deleted)."""
     if quantity is not None and quantity <= 0:
         line.delete()
@@ -152,42 +129,24 @@ def update_line(line, *, client=None, foil=None, condition=None, language=None, 
         line.language = language
     if quantity is not None:
         line.quantity = quantity
-    if for_sale is not UNSET:
-        line.for_sale = for_sale
     if (line.language, line.foil, line.condition) != key and not line.needs_confirmation:
-        line.price = _price(client, line)
         return _merge_or_save(line)
     line.save()
     return line
 
 
-def confirm_line(line, client, blueprint, language):
+def confirm_line(line, blueprint, language):
     """Resolve an uncertain line with the printing and language the owner picked."""
     line.blueprint = blueprint
     line.language = language
     line.needs_confirmation = False
     line.frame = None
     line.candidates = []
-    line.price = _price(client, line)
     return _merge_or_save(line)
 
 
 def _card_for(line):
     return catalog.card_for_blueprint(line.blueprint)
-
-
-def _list(item, line):
-    listing = getattr(item, "listing", None)
-    if listing is None:
-        Listing.objects.create(item=item, quantity=line.quantity, price=line.price)
-    elif listing.status == Listing.Status.SOLD:
-        listing.quantity, listing.price, listing.sold_at = line.quantity, line.price, None
-        listing.status = Listing.Status.TO_PUBLISH
-        listing.save()
-    else:
-        listing.quantity += line.quantity
-        listing.status = Listing.Status.TO_PUBLISH
-        listing.save(update_fields=["quantity", "status", "updated_at"])
 
 
 def discard_session(session):
@@ -200,7 +159,7 @@ def discard_session(session):
 
 
 def save_session(session):
-    """Write the draft into the collection. Returns (copies_saved, copies_listed)."""
+    """Write the draft into the collection. Returns the copies saved."""
     original = session
     with transaction.atomic():
         session = ScanSession.objects.select_for_update().get(pk=session.pk)
@@ -208,7 +167,7 @@ def save_session(session):
             raise ScanError("This scan session was already saved.")
         if session.lines.filter(needs_confirmation=True).exists():
             raise ScanError("Some cards still need confirmation.")
-        saved = listed = 0
+        saved = 0
         for line in session.lines.select_related("blueprint__expansion"):
             card = _card_for(line)
             item, created = CollectionItem.objects.get_or_create(
@@ -219,11 +178,8 @@ def save_session(session):
                 item.quantity += line.quantity
                 item.save(update_fields=["quantity", "updated_at"])
             saved += line.quantity
-            if line.listed:
-                _list(item, line)
-                listed += line.quantity
         session.status = ScanSession.Status.SAVED
         session.save(update_fields=["status", "updated_at"])
-        SyncLog.objects.create(owner=session.owner, message=f"Camera scan: {saved} cards saved, {listed} queued for sale")
+        SyncLog.objects.create(owner=session.owner, message=f"Camera scan: {saved} cards saved")
     original.status = session.status
-    return saved, listed
+    return saved

@@ -4,7 +4,6 @@ Decimals travel as strings ("5.00"). Blueprints are identified by their CardTrad
 """
 
 import re
-from decimal import Decimal, InvalidOperation
 
 from django.db.models import Sum
 from django.urls import reverse
@@ -77,14 +76,13 @@ class CandidateSerializer(BlueprintSerializer):
 
 class LineSerializer(serializers.ModelSerializer):
     blueprint = BlueprintSerializer(allow_null=True, read_only=True)
-    listed = serializers.BooleanField(read_only=True, help_text="Will be queued for sale when the session is saved")
     frame_url = serializers.SerializerMethodField(help_text="The photo, kept while the card needs confirmation")
     candidates = serializers.SerializerMethodField(
         help_text="The cards to choose from when it needs confirmation, those matching read_name first")
 
     class Meta:
         model = ScanLine
-        fields = ["uuid", "blueprint", "language", "foil", "condition", "quantity", "price", "for_sale", "listed",
+        fields = ["uuid", "blueprint", "language", "foil", "condition", "quantity",
                   "needs_confirmation", "read_name", "frame_url", "candidates"]
         read_only_fields = fields
 
@@ -113,7 +111,7 @@ class SessionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ScanSession
-        fields = ["uuid", "status", "expansion", "default_condition", "sale_threshold", "count", "last_line",
+        fields = ["uuid", "status", "expansion", "default_condition", "count", "last_line",
                   "is_phone", "phone_url", "phone_secure"]
         read_only_fields = fields
 
@@ -213,7 +211,6 @@ class ReviewSerializer(serializers.Serializer):
     pending = LineSerializer(many=True, help_text="Lines that still need confirmation")
     copies = serializers.IntegerField()
     unique = serializers.IntegerField()
-    listed = serializers.IntegerField(help_text="Copies that will be queued for sale")
 
 
 class MessageSerializer(serializers.Serializer):
@@ -223,7 +220,6 @@ class MessageSerializer(serializers.Serializer):
 
 class SaveResultSerializer(serializers.Serializer):
     saved = serializers.IntegerField()
-    listed = serializers.IntegerField()
     redirect = serializers.CharField(help_text="Where to go next (the collection)")
     messages = MessageSerializer(many=True, help_text="To show on the next page, like Django's messages")
 
@@ -270,23 +266,6 @@ class ConfirmSerializer(PickSerializer):
                                         help_text="Empty: the session's default condition")
 
 
-class ThresholdSerializer(serializers.Serializer):
-    threshold = serializers.CharField(
-        required=False, allow_blank=True, default="",
-        help_text="Lines priced at least this much are queued for sale, e.g. 2.50 (or 2,50); empty: none",
-    )
-
-    def validate_threshold(self, raw):
-        raw = raw.strip().replace(",", ".")
-        if not raw:
-            return None
-        try:
-            value = Decimal(raw).quantize(Decimal("0.01"))
-        except InvalidOperation:
-            raise serializers.ValidationError("Enter the threshold as a price, e.g. 2.50.")
-        return value if value.is_finite() and value >= 0 else None
-
-
 class LineUpdateSerializer(serializers.Serializer):
     """The fields to change; at least one, no others."""
 
@@ -294,8 +273,6 @@ class LineUpdateSerializer(serializers.Serializer):
     condition = serializers.ChoiceField(Condition.choices, required=False)
     language = LanguageField(required=False)
     quantity = serializers.IntegerField(min_value=0, required=False, help_text="0 removes the line")
-    for_sale = serializers.BooleanField(required=False, allow_null=True,
-                                        help_text="null: follow the session threshold")
 
     def validate(self, attrs):
         unknown = sorted(set(self.initial_data) - set(self.fields))

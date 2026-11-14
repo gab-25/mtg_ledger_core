@@ -130,7 +130,7 @@ class OwnerIsolationSweepTest(LedgerTestCase):
         "api_resolve": lambda t: t.conflict.pk,
         "scan_api_session": lambda t: t.session.uuid, "scan_api_captures": lambda t: t.session.uuid,
         "scan_api_search": lambda t: t.session.uuid, "scan_api_manual": lambda t: t.session.uuid,
-        "scan_api_review": lambda t: t.session.uuid, "scan_api_threshold": lambda t: t.session.uuid,
+        "scan_api_review": lambda t: t.session.uuid,
         "scan_api_save": lambda t: t.session.uuid,
         "scan_api_line": lambda t: t.line.uuid, "scan_api_undo": lambda t: t.line.uuid,
         "scan_api_confirm": lambda t: t.line.uuid, "scan_api_frame": lambda t: t.line.uuid,

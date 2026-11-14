@@ -11,7 +11,7 @@ from django.conf import settings
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.test import Client
-from django.urls import reverse
+from django.urls import NoReverseMatch, reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
@@ -20,7 +20,7 @@ from .api.scan import SESSION_LIST_LIMIT
 from .api.serializers import MAX_FRAME_BYTES
 from .forms import CatalogItemForm, ItemForm, ListingForm
 from .cardtrader import CardTraderError
-from .models import Blueprint, CollectionItem, Expansion, MarketPrice, ScanCapture, ScanLine, ScanSession
+from .models import Blueprint, CollectionItem, Expansion, ScanCapture, ScanLine, ScanSession
 from .openrouter import OpenRouterError
 from .recognition import Recognition
 from .tests import LedgerTestCase
@@ -59,9 +59,6 @@ class ScanApiBase(LedgerTestCase):
         patcher = mock.patch.object(services, "make_openrouter", mock.Mock(return_value=self.recognizer))
         patcher.start()
         self.addCleanup(patcher.stop)
-        price = mock.patch("ledger.pricing.price_for", return_value=Decimal("5.00"))
-        price.start()
-        self.addCleanup(price.stop)
         self.set_keys(openrouter="or-key", cardtrader="ct-token")
         self.client.defaults["HTTP_USER_AGENT"] = IPHONE
 
@@ -126,7 +123,7 @@ class SetupAndSessionTest(ScanApiBase):
         body = self.call("get", "scan_api_setup").json()
         self.assertTrue(any(e["code"] == "dmr" for e in body["expansions"]))
 
-    def test_start_preloads_catalog_and_prices(self):
+    def test_start_preloads_catalog(self):
         resp = self.call("post", "scan_api_sessions", data={"expansion_id": self.dmr.pk, "condition": "EX"})
         self.assertEqual(resp.status_code, 201)
         body = resp.json()
@@ -134,7 +131,7 @@ class SetupAndSessionTest(ScanApiBase):
         self.assertEqual((session.expansion, session.default_condition), (self.dmr, "EX"))
         self.assertEqual(body["session"]["expansion"]["code"], "dmr")
         self.assertEqual((body["session"]["status"], body["session"]["count"], body["warnings"]), ("open", 0, []))
-        self.assertTrue(MarketPrice.objects.filter(blueprint_ct_id=1201).exists())
+        self.assertNotIn("sale_threshold", body["session"])
 
     def test_start_all_expansions(self):
         resp = self.call("post", "scan_api_sessions", data={"expansion_id": None, "condition": "NM"})
@@ -162,7 +159,9 @@ class SetupAndSessionTest(ScanApiBase):
         line = body["last_line"]
         self.assertEqual(line["blueprint"]["id"], 1201)
         self.assertEqual(line["blueprint"]["expansion"]["code"], "dmr")
-        self.assertEqual((line["language"], line["condition"], line["price"]), ("IT", "NM", "5.00"))
+        self.assertEqual((line["language"], line["condition"]), ("IT", "NM"))
+        for gone in ("price", "for_sale", "listed"):
+            self.assertNotIn(gone, line)
 
     def test_saved_session_is_still_readable(self):
         session = self.start()
@@ -537,37 +536,26 @@ class PhoneTest(ScanApiBase):
 
 
 class ReviewTest(ScanApiBase):
-    def test_threshold_and_save(self):
+    def test_save(self):
         session = self.start()
         self.capture(session)
-        body = self.call("put", "scan_api_threshold", session.uuid, data={"threshold": "3,00"}).json()
-        self.assertEqual(body["session"]["sale_threshold"], "3.00")
-        self.assertEqual((body["copies"], body["unique"], body["listed"]), (1, 1, 1))
-        self.assertTrue(body["lines"][0]["listed"])
+        body = self.call("get", "scan_api_review", session.uuid).json()
+        self.assertEqual((body["copies"], body["unique"]), (1, 1))
+        self.assertNotIn("listed", body)
         resp = self.call("post", "scan_api_save", session.uuid)
-        self.assertEqual(resp.json(), {"saved": 1, "listed": 1, "redirect": "/", "messages": [
-            {"level": "success", "text": "Saved 1 cards, 1 queued for sale."}]})
+        self.assertEqual(resp.json(), {"saved": 1, "redirect": "/", "messages": [
+            {"level": "success", "text": "Saved 1 cards."}]})
         self.assertTrue(CollectionItem.objects.filter(card__ct_blueprint_id=1201).exists())
 
-    def test_threshold_cleared(self):
-        session = self.start()
-        self.call("put", "scan_api_threshold", session.uuid, data={"threshold": "3"})
-        body = self.call("put", "scan_api_threshold", session.uuid, data={"threshold": ""}).json()
-        self.assertIsNone(body["session"]["sale_threshold"])
-
-    def test_threshold_must_be_a_price(self):
-        session = self.start()
-        body = self.assertInvalid(self.call("put", "scan_api_threshold", session.uuid, data={"threshold": "abc"}),
-                                  "threshold")
-        self.assertEqual(body["threshold"], ["Enter the threshold as a price, e.g. 2.50."])
+    def test_threshold_endpoint_is_gone(self):
+        with self.assertRaises(NoReverseMatch):
+            reverse("ledger:scan_api_threshold", args=["00000000-0000-0000-0000-000000000000"])
 
     def test_closed_session_rejects_changes(self):
         session = self.start()
         line = self.capture(session).json()["line"]
         self.call("post", "scan_api_save", session.uuid)
         self.assertError(self.call("post", "scan_api_save", session.uuid), 409, "closed")
-        self.assertError(self.call("put", "scan_api_threshold", session.uuid, data={"threshold": "1"}),
-                         409, "closed")
         self.assertError(self.call("post", "scan_api_manual", session.uuid,
                                    data={"blueprint_id": 1201, "language": "EN"}), 409, "closed")
         self.assertError(self.call("patch", "scan_api_line", line["uuid"], data={"foil": True}), 409, "closed")
@@ -586,12 +574,11 @@ class LineTest(ScanApiBase):
         return self.call("patch", "scan_api_line", self.line["uuid"], data=data)
 
     def test_patch_fields(self):
-        body = self.patch({"foil": True, "condition": "EX", "language": "en", "quantity": 3, "for_sale": False}).json()
+        body = self.patch({"foil": True, "condition": "EX", "language": "en", "quantity": 3}).json()
         line = body["line"]
-        self.assertEqual((line["foil"], line["condition"], line["language"], line["quantity"], line["for_sale"]),
-                         (True, "EX", "EN", 3, False))
+        self.assertEqual((line["foil"], line["condition"], line["language"], line["quantity"]),
+                         (True, "EX", "EN", 3))
         self.assertEqual(body["count"], 3)
-        self.assertIsNone(self.patch({"for_sale": None}).json()["line"]["for_sale"])
 
     def test_patch_quantity_zero_deletes(self):
         self.assertEqual(self.patch({"quantity": 0}).json(), {"line": None, "count": 0})
@@ -600,7 +587,7 @@ class LineTest(ScanApiBase):
         for data, fields in (({"foil": "maybe"}, ["foil"]), ({"condition": "XX"}, ["condition"]),
                              ({"language": "KL"}, ["language"]), ({"quantity": -1}, ["quantity"]),
                              ({"quantity": "two"}, ["quantity"]), ({"quantity": True}, ["quantity"]),
-                             ({"for_sale": "maybe"}, ["for_sale"]), ({"price": "1"}, ["price"]),
+                             ({"for_sale": False}, ["for_sale"]), ({"price": "1"}, ["price"]),
                              ({"foil": True, "price": "1"}, ["price"]), ({}, ["non_field_errors"]),
                              (["foil"], ["non_field_errors"])):
             with self.subTest(data=data):
@@ -645,12 +632,6 @@ class ProtocolTest(ScanApiBase):
         self.assertError(resp, 405, "method_not_allowed")
         self.assertEqual(set(resp["Allow"].split(", ")), {"GET", "POST", "OPTIONS"})
         self.assertError(self.call("post", "scan_api_review", session.uuid), 405, "method_not_allowed")
-        self.assertError(self.call("post", "scan_api_threshold", session.uuid, data={}), 405, "method_not_allowed")
-
-    def test_decimals_are_strings(self):
-        session = self.start()
-        line = self.capture(session).json()["line"]
-        self.assertEqual(line["price"], "5.00")
 
 
 class SchemaTest(LedgerTestCase):
@@ -725,7 +706,7 @@ class ScanIsolationTest(ScanApiBase):
         session_calls = [
             ("get", "scan_api_session", None), ("get", "scan_api_review", None),
             ("get", "scan_api_search", None), ("post", "scan_api_manual", {}),
-            ("put", "scan_api_threshold", {"threshold": "1.00"}), ("post", "scan_api_save", None),
+            ("post", "scan_api_save", None),
         ]
         for method, name, data in session_calls:
             with self.subTest(name=name):

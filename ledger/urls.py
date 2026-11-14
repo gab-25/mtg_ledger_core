@@ -34,7 +34,6 @@ urlpatterns = [
     path("api/scan/sessions/<uuid:uid>/search/", scan_api.search, name="scan_api_search"),
     path("api/scan/sessions/<uuid:uid>/manual/", scan_api.manual, name="scan_api_manual"),
     path("api/scan/sessions/<uuid:uid>/review/", scan_api.review, name="scan_api_review"),
-    path("api/scan/sessions/<uuid:uid>/threshold/", scan_api.threshold, name="scan_api_threshold"),
     path("api/scan/sessions/<uuid:uid>/save/", scan_api.save, name="scan_api_save"),
     path("api/scan/lines/<uuid:uid>/", scan_api.line_detail, name="scan_api_line"),
     path("api/scan/lines/<uuid:uid>/undo/", scan_api.line_undo, name="scan_api_undo"),
